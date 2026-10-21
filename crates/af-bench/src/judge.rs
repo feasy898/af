@@ -23,6 +23,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::swev::SwevTask;
+use crate::tb;
 
 /// 判分器（与 swev.rs 同源路径；工具链在 venv 里，不进仓库）。
 const JUDGE_PY: &str = "/home/pan-ding/workspace/agent黑灯工厂/tools/swev-judge.py";
@@ -80,12 +81,19 @@ pub fn verify_clean(
     );
     let _ = docker_quiet(&["rm", "-f", &container]);
     // 干净容器：**不注入任何代理环境变量**（这一条就是 POC-1 的全部意义）。
+    // 资源护栏（2026-10-21，常量与校准注释见 tb 模块）：判分容器 4g/256——
+    // 判分跑完整测试套件（pip install . + pytest），给足但封顶；串行判分口径下
+    // 全厂同时只有个位数判分容器，14 臂 agent 6g + 判分 4g 仍在 125G 预算内。
     let started = Command::new("docker")
         .args([
             "run",
             "-d",
             "--name",
             &container,
+            "--memory",
+            tb::SWEV_EVAL_CONTAINER_MEM,
+            "--pids-limit",
+            tb::SWEV_EVAL_CONTAINER_PIDS,
             &task.image,
             "sleep",
             "infinity",
