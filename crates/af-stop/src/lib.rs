@@ -5,9 +5,9 @@
 //! 为预留接口：默认空库（全部走全局默认参数），可按指纹登记覆盖项。
 //!
 //! 三条规则（按优先级从高到低，同一事件命中多条时只返回最高一条）：
-//! 1. **指纹连击**：连续 N 次、指纹（工具名+错误码）完全相同的工具错误
-//!    → `Stop(NoInfluence)`。任何其他事件（成功、不同指纹、check、普通错误）
-//!    都会打断"连续"。
+//! 1. **指纹连击**：连续 N 次、指纹（工具名+错误码）完全相同的工具错误，
+//!    或连续 N 次逐字相同的成功调用（`ToolOk` 带 `fingerprint`）→ `Stop(NoInfluence)`。
+//!    任何其他事件（无指纹成功、不同指纹、check、普通错误）都会打断"连续"。
 //! 2. **确定性节点首败**：check 型节点第一次失败 → `Stop(CheckFirstFail)`。
 //! 3. **普通错误阈值**：工具错误 + 普通错误累计达到 M → `Escalate`。
 //!
@@ -61,8 +61,15 @@ impl Fingerprint {
 pub enum Event {
     /// 工具调用失败，携带工具名与错误码（喂给规则①与规则③）。
     ToolError { tool: String, error_code: String },
-    /// 工具调用成功（打断规则①的"连续"序列）。
-    ToolOk { tool: String },
+    /// 工具调用成功。`fingerprint` 为 Some 时表示「与上一个调用逐字相同的重复调用」
+    /// （调用方给的是入参指纹），同样按指纹连击喂给规则①——bash 类工具恒以成功
+    /// 结算（退出码只是输出文本末行），纯 ToolError 连击对它永远休眠，fix4 补此路。
+    /// None 时与旧语义一致：打断"连续"序列。
+    ToolOk {
+        tool: String,
+        #[serde(default)]
+        fingerprint: Option<String>,
+    },
     /// 确定性节点（check 型）失败（规则②：首败即停）。
     CheckFailed { node: String },
     /// 非工具类普通错误（只喂给规则③）。
@@ -295,11 +302,46 @@ impl StopEngine {
                 }
                 Decision::Continue
             }
-            // 其余事件：打断"连续"，普通错误计入阈值。
-            Event::ToolOk { .. } => {
-                self.state.streak = None;
-                Decision::Continue
-            }
+            // 其余事件：无指纹的成功打断"连续"（旧语义）；带指纹的成功按同一指纹
+            // 累加连击——重复调用与重复错误同权（重复执行已不产生新信息），
+            // 但不计入普通错误阈值（成功不是错误）。
+            Event::ToolOk { tool, fingerprint } => match fingerprint {
+                None => {
+                    self.state.streak = None;
+                    Decision::Continue
+                }
+                Some(code) => {
+                    let fp = Fingerprint {
+                        tool,
+                        error_code: format!("ok:{code}"),
+                    };
+                    let streak_len = match &mut self.state.streak {
+                        Some((cur, len)) if *cur == fp => {
+                            *len += 1;
+                            *len
+                        }
+                        _ => {
+                            self.state.streak = Some((fp.clone(), 1));
+                            1
+                        }
+                    };
+                    let entry = self.policy.store.get(&fp);
+                    let limit = entry
+                        .and_then(|e| e.streak_limit)
+                        .unwrap_or(self.policy.fingerprint_streak_limit);
+                    if limit > 0 && streak_len >= limit {
+                        return match entry.map(|e| e.action.clone()) {
+                            Some(FingerprintAction::Escalate) => Decision::Escalate {
+                                reason: EscalateReason::FingerprintPolicy,
+                            },
+                            _ => Decision::Stop {
+                                reason: StopReason::NoInfluence,
+                            },
+                        };
+                    }
+                    Decision::Continue
+                }
+            },
             Event::GenericError { .. } => {
                 self.state.streak = None;
                 self.state.normal_errors += 1;
@@ -453,7 +495,8 @@ mod tests {
         );
         assert_eq!(
             eng.feed(Event::ToolOk {
-                tool: "search".into()
+                tool: "search".into(),
+                fingerprint: None,
             }),
             Decision::Continue
         );
@@ -489,6 +532,102 @@ mod tests {
                 "i={i}"
             );
         }
+    }
+
+    // ---- 规则① 扩展（fix4）：逐字重复的成功调用同权计入指纹连击 ----
+
+    fn tool_ok_fp(code: &str) -> Event {
+        Event::ToolOk {
+            tool: "bash".into(),
+            fingerprint: Some(code.into()),
+        }
+    }
+
+    #[test]
+    fn rule1_repeated_identical_toolok_fingerprint_stops() {
+        let mut eng = StopEngine::new(StopPolicy {
+            normal_error_threshold: 100, // 调高 M：证明本规则不动普通错误阈值
+            ..Default::default()
+        });
+        assert_eq!(eng.feed(tool_ok_fp("cmd-a")), Decision::Continue);
+        assert_eq!(eng.feed(tool_ok_fp("cmd-a")), Decision::Continue);
+        assert_eq!(
+            eng.feed(tool_ok_fp("cmd-a")),
+            Decision::Stop {
+                reason: StopReason::NoInfluence
+            }
+        );
+        // 成功连击不冒充错误：普通错误计数保持 0
+        assert_eq!(eng.normal_error_count(), 0);
+        assert_eq!(
+            eng.current_streak(),
+            Some((&Fingerprint::new("bash", "ok:cmd-a"), 3))
+        );
+    }
+
+    #[test]
+    fn rule1_different_toolok_fingerprints_never_trigger() {
+        let mut eng = StopEngine::new(StopPolicy {
+            normal_error_threshold: 100,
+            ..Default::default()
+        });
+        for i in 0..20 {
+            assert_eq!(
+                eng.feed(tool_ok_fp(&format!("cmd-{i}"))),
+                Decision::Continue,
+                "i={i}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule1_toolok_without_fingerprint_breaks_ok_streak() {
+        let mut eng = StopEngine::new(StopPolicy {
+            normal_error_threshold: 100,
+            ..Default::default()
+        });
+        assert_eq!(eng.feed(tool_ok_fp("cmd-a")), Decision::Continue);
+        assert_eq!(eng.feed(tool_ok_fp("cmd-a")), Decision::Continue);
+        // 无指纹成功（不同调用）打断"连续"，之后从头重数
+        assert_eq!(
+            eng.feed(Event::ToolOk {
+                tool: "bash".into(),
+                fingerprint: None,
+            }),
+            Decision::Continue
+        );
+        assert_eq!(eng.current_streak(), None);
+        assert_eq!(eng.feed(tool_ok_fp("cmd-a")), Decision::Continue);
+        assert_eq!(eng.feed(tool_ok_fp("cmd-a")), Decision::Continue);
+        // 打断后从头重数：第 3 次（连续）即停。
+        assert_eq!(
+            eng.feed(tool_ok_fp("cmd-a")),
+            Decision::Stop {
+                reason: StopReason::NoInfluence
+            }
+        );
+    }
+
+    #[test]
+    fn rule1_tool_error_breaks_ok_streak_and_vice_versa() {
+        let mut eng = StopEngine::new(StopPolicy {
+            normal_error_threshold: 100,
+            ..Default::default()
+        });
+        assert_eq!(eng.feed(tool_ok_fp("cmd-a")), Decision::Continue);
+        assert_eq!(eng.feed(tool_ok_fp("cmd-a")), Decision::Continue);
+        // 错误指纹与 ok 指纹不同：打断成功连击，进入错误连击
+        assert_eq!(eng.feed(tool_err("bash", "E_TIMEOUT")), Decision::Continue);
+        assert_eq!(
+            eng.current_streak(),
+            Some((&Fingerprint::new("bash", "E_TIMEOUT"), 1))
+        );
+        // 错误连击也会被带指纹的成功打断
+        assert_eq!(eng.feed(tool_ok_fp("cmd-a")), Decision::Continue);
+        assert_eq!(
+            eng.current_streak(),
+            Some((&Fingerprint::new("bash", "ok:cmd-a"), 1))
+        );
     }
 
     // ---- 规则②：确定性节点（check 型）首败即停 ----
@@ -654,7 +793,8 @@ mod tests {
         assert_eq!(eng.feed(tool_err("browser", "E_NAV")), Decision::Continue);
         assert_eq!(
             eng.feed(Event::ToolOk {
-                tool: "search".into()
+                tool: "search".into(),
+                fingerprint: None,
             }),
             Decision::Continue
         );

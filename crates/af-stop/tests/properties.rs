@@ -167,6 +167,7 @@ fn arb_event() -> impl Strategy<Value = Event> {
         }),
         arb_tool().prop_map(|tool| Event::ToolOk {
             tool: tool.to_string(),
+            fingerprint: None,
         }),
         arb_node().prop_map(|node| Event::CheckFailed {
             node: node.to_string(),
@@ -366,6 +367,7 @@ fn noise_event(noise: Noise) -> Event {
     match noise {
         Noise::ToolOk { tool } => Event::ToolOk {
             tool: tool.to_string(),
+            fingerprint: None,
         },
         Noise::Check { node } => Event::CheckFailed {
             node: node.to_string(),

@@ -262,6 +262,7 @@ fn engine_counters_roundtrip_across_restart() {
         ledger
             .feed(Event::ToolOk {
                 tool: "search".into(),
+                fingerprint: None,
             })
             .unwrap(),
         Decision::Continue
@@ -501,6 +502,7 @@ fn ledger_feed_matches_the_pure_engine_across_restart() {
         tool("search", "E_TIMEOUT"),
         Event::ToolOk {
             tool: "search".into(),
+            fingerprint: None,
         },
     ];
     for event in &events {

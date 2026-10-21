@@ -1,7 +1,8 @@
 //! Run 循环。
 //!
 //! 每轮：渲染上下文 → 调模型 → 解析工具调用 → 副作用走 effect gateway，纯函数本地执行
-//! → 写 trace → 止损 → 按轮扣预算。预算不足、止损、完成信号、无工具轮上限、轮次上限都停。
+//! → 写 trace → 止损 → 按轮扣预算。预算不足、止损、完成信号、无工具轮上限、轮次上限、
+//! 墙钟预算（fix4，按激活计时）都停。
 //! 每轮开始前如果余额已经不够，模型不会被调用。
 //!
 //! 断点 [`Breakpoint::BeforeTurnCommit`] 在副作用已经落进网关、运行行还没提交时返回。
@@ -115,6 +116,11 @@ pub enum RunStatus {
         signal: String,
     },
     MaxTurns,
+    /// 墙钟预算耗尽（fix4，对齐商业线 os_timeout 口径）。按本次激活计时，
+    /// 轮次间检查——不抢占执行中的轮，超时后该轮走完即收束。
+    WallTimeout {
+        elapsed_secs: u64,
+    },
     ToolFreeLimit,
     BudgetExhausted {
         fault: crate::budget::BudgetFault,
@@ -307,6 +313,54 @@ const TOOL_FREE_FEEDBACK: &str = "[Harness feedback] Your previous message conta
 /// fix2 finish_reason=length 专项反馈：被截断且无工具调用是死态，转成可恢复态。
 const LENGTH_FEEDBACK: &str = "[Harness feedback] Your previous response was truncated before it produced a tool call (finish reason: length). Be more concise and issue a tool call in this turn.";
 
+/// fix4 墙钟收尾反馈前缀（判重锚：transcript 里出现同前缀消息即不再重发）。
+const WALL_GENTLE_PREFIX: &str = "[Harness feedback] Time budget:";
+const WALL_STRONG_PREFIX: &str = "[Harness feedback] FINAL time warning:";
+/// 墙钟剩余阈：剩 5 分钟发 gentle、剩 2 分钟发 strong，各恰好一次。
+const WALL_GENTLE_REMAINING_SECS: u64 = 300;
+const WALL_STRONG_REMAINING_SECS: u64 = 120;
+
+/// fix4 墙钟收尾机制（fix2 轮次收尾的墙钟版）：预算可见性——模型按可知的
+/// 死线规划提交，而不是被硬切在半路。以 transcript 前缀判重，恰好一次。
+fn push_wall_budget_reminders(live: &mut Live, now_ms: u64, deadline_ms: u64) {
+    let remaining_secs = deadline_ms.saturating_sub(now_ms) / 1_000;
+    let has_marker = |live: &Live, prefix: &str| {
+        live.transcript
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::User { text } if text.starts_with(prefix)))
+    };
+    if remaining_secs <= WALL_STRONG_REMAINING_SECS {
+        if !has_marker(live, WALL_STRONG_PREFIX) {
+            live.transcript.push(TranscriptItem::User {
+                text: format!(
+                    "{WALL_STRONG_PREFIX} about 2 minutes remain before this run is force-stopped by the wall-clock budget. Submit your best current fix NOW (print the completion token via a command) — no further turns will run after the deadline."
+                ),
+            });
+        }
+        return;
+    }
+    if remaining_secs <= WALL_GENTLE_REMAINING_SECS && !has_marker(live, WALL_GENTLE_PREFIX) {
+        live.transcript.push(TranscriptItem::User {
+            text: format!(
+                "{WALL_GENTLE_PREFIX} about 5 minutes remain before the wall-clock budget force-stops this run. If your fix is already verified, submit now (print the completion token via a command). Do not start new lines of work."
+            ),
+        });
+    }
+}
+
+/// fix4 调用指纹：入参 JSON 的 FNV-1a 64 位 + 长度。喂给止损引擎识别
+/// 「逐字重复的成功调用」（bash 恒以 ToolOk 结算，纯 ToolError 连击对它休眠）。
+/// 只进内存与止损快照（哈希，非原文），不进对话。
+fn call_fingerprint(args: &Value) -> Option<String> {
+    let text = serde_json::to_string(args).ok()?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(format!("fnv1a64:{hash:016x}:{}", text.len()))
+}
+
 enum Dispatch {
     Done(Done),
     Denied(RunStatus),
@@ -319,6 +373,9 @@ struct Done {
     is_error: bool,
     error_code: String,
     effect: EffectClass,
+    /// 成功调用的入参指纹（fix4）。Some 时喂给止损引擎识别逐字重复调用；
+    /// 失败调用不走此路（失败本就有 ToolError 指纹）。
+    fingerprint: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -412,6 +469,14 @@ impl Opened {
     fn drive(&self, launch: &Launch<'_>, live: &mut Live) -> Result<RunReport> {
         let max_turns = launch.spec.policy.max_turns;
         let per_turn = launch.spec.policy.budget_ref.per_turn;
+        // fix4 墙钟预算：按本次激活计时（进程级口径，与商业线 os_timeout 同构——
+        // 续跑激活重新起算；轮次间检查，不抢占执行中的轮）。
+        let wall_started_ms = self.clock.wall_ms();
+        let wall_deadline_ms = launch
+            .spec
+            .policy
+            .wall_timeout_secs
+            .map(|secs| wall_started_ms.saturating_add(secs.saturating_mul(1_000)));
         loop {
             if let Some(status) = terminal_status(&live.row)? {
                 return report_of(&live.row, status);
@@ -419,10 +484,21 @@ impl Opened {
             if live.row.turn_index >= max_turns {
                 return self.finish(live, RunStatus::MaxTurns);
             }
+            if let Some(deadline) = wall_deadline_ms {
+                let now = self.clock.wall_ms();
+                if now >= deadline {
+                    return self.finish(
+                        live,
+                        RunStatus::WallTimeout {
+                            elapsed_secs: now.saturating_sub(wall_started_ms) / 1_000,
+                        },
+                    );
+                }
+            }
             if let Err(fault) = live.budget.probe(per_turn, self.clock.wall_ms()) {
                 return self.finish(live, RunStatus::BudgetExhausted { fault });
             }
-            match self.one_turn(launch, live)? {
+            match self.one_turn(launch, live, wall_deadline_ms)? {
                 TurnOutcome::Terminal(status) => return self.finish(live, status),
                 TurnOutcome::Interrupted => {
                     return Err(Error::Interrupted {
@@ -435,7 +511,12 @@ impl Opened {
         }
     }
 
-    fn one_turn(&self, launch: &Launch<'_>, live: &mut Live) -> Result<TurnOutcome> {
+    fn one_turn(
+        &self,
+        launch: &Launch<'_>,
+        live: &mut Live,
+        wall_deadline_ms: Option<u64>,
+    ) -> Result<TurnOutcome> {
         let per_turn = launch.spec.policy.budget_ref.per_turn;
         // fix2 收尾机制（失败轨迹分析 建议1）：轮次预算可见性。S1 实证 60 例 max_turns
         // 中 19 例补丁已过判分仍在"再验一组"——模型按无限预算规划验证。
@@ -458,6 +539,10 @@ impl Opened {
                     "[Harness feedback] FINAL warning: only {strong_left} turns remain. Submit your best current fix NOW."
                 ),
             });
+        }
+        // fix4 墙钟收尾：剩 5 分钟 gentle、剩 2 分钟 strong，各恰好一次。
+        if let Some(deadline) = wall_deadline_ms {
+            push_wall_budget_reminders(live, self.clock.wall_ms(), deadline);
         }
         let system = render(&launch.spec.context_template, &launch.vars)?;
         let mut request = Vec::with_capacity(live.transcript.len() + 1);
@@ -649,6 +734,7 @@ impl Opened {
         } else {
             Event::ToolOk {
                 tool: done.name.clone(),
+                fingerprint: done.fingerprint.clone(),
             }
         };
         self.trace.write_normal(
@@ -879,6 +965,7 @@ fn done_ok(call: &crate::endpoint::ParsedToolCall, output: Value, effect: Effect
         is_error: false,
         error_code: String::new(),
         effect,
+        fingerprint: call_fingerprint(&call.arguments),
     }
 }
 
@@ -897,6 +984,7 @@ fn done_error(
         is_error: true,
         error_code: failure.error_code,
         effect,
+        fingerprint: None,
     }
 }
 

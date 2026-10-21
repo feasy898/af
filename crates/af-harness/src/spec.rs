@@ -142,6 +142,12 @@ pub struct BudgetRef {
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     pub max_turns: u32,
+    /// 墙钟预算（秒）。Some(n) 时单次激活的运行超过 n 秒即在轮次间收束为
+    /// [`crate::run::RunStatus::WallTimeout`]——对齐商业线 os_timeout 的进程级
+    /// 墙钟口径（fix4）：计费的是时间不是调用次数，且每次激活重新起算。
+    /// None = 不限墙钟（缺省，历史规格原样可读）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_timeout_secs: Option<u64>,
     pub stop: StopCondition,
     pub budget_ref: BudgetRef,
 }
@@ -279,6 +285,11 @@ fn validate_policy(policy: &Policy) -> Result<()> {
             "budget_ref.dimension 不能为空，且只含字母数字和 _.:-".into(),
         ));
     }
+    if policy.wall_timeout_secs == Some(0) {
+        return Err(Error::InvalidSpec(
+            "wall_timeout_secs 为 0 非法：不限墙钟请省略字段，限时请给正数".into(),
+        ));
+    }
     let mut seen = BTreeSet::new();
     for signal in &policy.stop.completion_signals {
         if signal.is_empty() {
@@ -370,6 +381,23 @@ mod tests {
         assert!(spec.validate().is_err());
         spec = decode_spec(crate::EXAMPLE_SPEC_JSON).unwrap();
         spec.endpoint.base_url = "https://user:pass@api.example".into();
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn wall_timeout_secs_is_optional_roundtrips_and_rejects_zero() {
+        // 缺省（历史规格）不带字段：None，且编码不写出该字段（skip_serializing_if）。
+        let base = decode_spec(crate::EXAMPLE_SPEC_JSON).unwrap();
+        assert_eq!(base.policy.wall_timeout_secs, None);
+        let encoded = encode_spec(&base).unwrap();
+        assert!(!encoded.contains("wall_timeout_secs"), "{encoded}");
+
+        let mut spec = decode_spec(crate::EXAMPLE_SPEC_JSON).unwrap();
+        spec.policy.wall_timeout_secs = Some(1_800);
+        let again = decode_spec(&encode_spec(&spec).unwrap()).unwrap();
+        assert_eq!(again, spec);
+
+        spec.policy.wall_timeout_secs = Some(0);
         assert!(spec.validate().is_err());
     }
 }

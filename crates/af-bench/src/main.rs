@@ -580,6 +580,7 @@ const SWEV_INSTANCE_PROTOCOL: &str = r#"# How to work
 # Hard boundaries
 - NEVER modify test files or test configuration (any path containing "test", plus conftest.py, tox.ini, pytest.ini, setup.cfg). The grading harness owns the tests; a patch touching them is rejected.
 - Do NOT edit changelogs or release notes (CHANGES.rst, docs/changes*, docs/releases*) — grading ignores documentation; editing it only burns your turn budget.
+- The whole run has a HARD WALL-CLOCK BUDGET of 30 minutes. When the harness tells you little time remains, submit immediately with your best current fix — the run is killed at the deadline with whatever is on disk.
 - The container has NO usable internet access: pip install/download, curl, wget and git remotes fail. Never retry a failed download — implement the fix with what is already in the container.
 - A run that ends with no code changes is an automatic failure.
 - Every bash command runs in a fresh non-interactive shell starting in /testbed; shell state (cd, exported variables) does NOT persist between commands. Never open editors or interactive prompts; use non-interactive flags (e.g. -y, DEBIAN_FRONTEND=noninteractive). Commands may be killed by a timeout.
@@ -605,6 +606,7 @@ fn status_label(status: &RunStatus) -> String {
     match status {
         RunStatus::Completed { .. } => "completed".into(),
         RunStatus::MaxTurns => "max_turns".into(),
+        RunStatus::WallTimeout { .. } => "wall_timeout".into(),
         RunStatus::ToolFreeLimit => "tool_free_limit".into(),
         RunStatus::BudgetExhausted { .. } => "budget_exhausted".into(),
         RunStatus::Stopped { .. } => "stopped".into(),
@@ -776,6 +778,12 @@ fn run_swev(args: &Args) -> Result<(), String> {
                 policy: Policy {
                     // fix2 对齐（审计 §6.A.1）：60 → 250 步（1 turn = 1 模型调用，与 mini step 同义）。
                     max_turns: 250,
+                    // fix4 对齐（fix4-align-r1）：墙钟预算 1800s——商业 mcode 线同一模型
+                    // 在 os_timeout=1800s 内能走完定位→修改→验证全流程，af 的纯调用数
+                    // 预算却把成批 run 硬切在半路（fix1 代际 76/132 终态 max_turns，
+                    // 墙钟中位 1112s/992s 远未到 1800s，瓶颈是调用次数而非时间）。
+                    // 时间成为约束后与商业线同口径：同样 30 分钟，够就走完全流程。
+                    wall_timeout_secs: Some(1_800),
                     stop: StopCondition {
                         completion_signals: vec!["TASK_COMPLETE".into()],
                         tool_free_turn_limit: 3,
@@ -856,7 +864,8 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         "trial": args.trial,
                         "reward": Value::Null,
                         "status": "run_failed",
-                        "scaffold": "v3",
+                        // fix4（结果代号 bump：预算语义变更）：scaffold v4 = v3 + 墙钟 1800s。
+                        "scaffold": "v4",
                         // D-20 项 1：run_failed 行也记实际目录（trail 留在现场供复核）。
                         "run_dir": attempt_dir.display().to_string(),
                         "eval_sha256": Value::Null,
@@ -903,10 +912,12 @@ fn run_swev(args: &Args) -> Result<(), String> {
             "trial": args.trial,
             "reward": resolved,
             "status": status_label(&report.status),
-            // fix2（结果代号 fix2，审计 §6.A 对齐）：scaffold v3 = 提交式完成协议 +
-            // instance 纪律 + 250 步/$3/温度0/top_p1/max_tokens 32000 + 无 gate 重试。
-            // reasoning 档位按审计 §6.A.7 显式声明（保持 Off = mini 默认不发 thinking）。
-            "scaffold": "v3",
+            // fix4（结果代号 bump：预算语义变更，机制=墙钟预算 1800s 对齐商业线 +
+            // 逐字重复成功调用指纹刹车）：scaffold v4 = v3 + wall_timeout 1800s。
+            // v3 原文：提交式完成协议 + instance 纪律 + 250 步/$3/温度0/top_p1/
+            // max_tokens 32000 + 无 gate 重试。reasoning 档位按审计 §6.A.7 显式声明
+            // （保持 Off = mini 默认不发 thinking）。
+            "scaffold": "v4",
             "reasoning_tier": "off",
             // D-20 项 1：实际 run 目录（重跑按序号递增，不再同名覆写）。
             "run_dir": run_dir.display().to_string(),
@@ -1148,6 +1159,8 @@ fn run_tb(args: &Args) -> Result<(), String> {
                 .map_err(|err| format!("bash 工具声明: {err}"))?],
             policy: Policy {
                 max_turns: 40,
+                // fix4：墙钟预算只上 swe-v 线（证据都在那条线）；TB 口径不动。
+                wall_timeout_secs: None,
                 stop: StopCondition {
                     completion_signals: vec!["TASK_COMPLETE".into()],
                     tool_free_turn_limit: 3,
@@ -1316,6 +1329,8 @@ fn run_injec(args: &Args) -> Result<(), String> {
             toolset: task.tools.clone(),
             policy: Policy {
                 max_turns: 16,
+                // fix4：墙钟预算只上 swe-v 线；InjecAgent 口径不动。
+                wall_timeout_secs: None,
                 stop: StopCondition {
                     completion_signals: Vec::new(),
                     tool_free_turn_limit: 1,

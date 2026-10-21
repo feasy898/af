@@ -81,6 +81,7 @@ fn smoke() -> Result<(), Box<dyn std::error::Error>> {
         toolset: Vec::new(),
         policy: Policy {
             max_turns: 1,
+            wall_timeout_secs: None,
             stop: StopCondition {
                 completion_signals: Vec::new(),
                 tool_free_turn_limit: 8,
@@ -168,6 +169,7 @@ fn label(status: &RunStatus) -> String {
     match status {
         RunStatus::Completed { signal } => format!("completed {signal}"),
         RunStatus::MaxTurns => "max_turns".into(),
+        RunStatus::WallTimeout { elapsed_secs } => format!("wall_timeout {elapsed_secs}s"),
         RunStatus::ToolFreeLimit => "tool_free_limit".into(),
         RunStatus::BudgetExhausted { .. } => "budget_exhausted".into(),
         RunStatus::Stopped { .. } => "stopped".into(),
