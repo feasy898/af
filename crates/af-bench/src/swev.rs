@@ -64,8 +64,14 @@ pub fn setup(host: &str, task: &SwevTask, profile: &str) -> Result<tb::TbEnv, St
          -e HTTP_PROXY=http://172.17.0.1:8123 \
          -e NO_PROXY=localhost,127.0.0.1,100.64.0.0/10"
     };
+    // 资源护栏（2026-10-21，常量与校准注释见 tb 模块）：agent 容器 6g/512。
+    // 基建修复不改判分语义：上限远高于实测峰值（agent 期 30-90MiB）；
+    // 本代际判分在该容器内原地执行，判分负载同受此封顶。
+    let mem = tb::SWEV_AGENT_CONTAINER_MEM;
+    let pids = tb::SWEV_AGENT_CONTAINER_PIDS;
     let script = format!(
         "docker run -d --name {container} \
+         --memory {mem} --pids-limit {pids} \
          {proxy_env} \
          {} sleep infinity",
         task.image
