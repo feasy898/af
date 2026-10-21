@@ -164,7 +164,21 @@ pub fn image_digest(host: &str, image_ref: &str) -> Result<(String, &'static str
 }
 
 /// 数据根所在文件系统剩余字节（磁盘门 D-15 的观测输入）。
+/// 红队⑩⑦修复：df 瞬故障重试一次（读写契约——写侧尽量不产 null；仍失败才由调用方落 null，
+/// checker 侧 null 记 WARN 不记 FAIL）。
 pub fn disk_free_bytes(path: &Path) -> Result<u64, String> {
+    let mut last_err = String::new();
+    for _ in 0..2 {
+        match disk_free_once(path) {
+            Ok(v) => return Ok(v),
+            Err(err) => last_err = err,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    Err(last_err)
+}
+
+fn disk_free_once(path: &Path) -> Result<u64, String> {
     let out = Command::new("df")
         .args(["-B1", "--output=avail", &path.to_string_lossy()])
         .output()
@@ -271,12 +285,25 @@ pub fn bench_binary_sha256() -> Result<String, String> {
     Ok(sha256_bytes(&data))
 }
 
-/// af 仓库 HEAD sha（只读）。AF_OBS_GIT_REV 可覆盖；工作树不在时落 "unknown"。
+/// af 仓库 HEAD sha（红队④修复：编译期由 build.rs 烧录，并带脏树标注）。
+/// 只 rev-parse HEAD 会把"提交前/脏树构建"的二进制标到错误 commit——二进制 sha256
+/// 能兜底字节，git rev 标签会误导。优先级：AF_OBS_GIT_REV（调度器显式钉值）>
+/// 编译期 AF_GIT_REV（build.rs 在构建机现算，脏树加 -dirty.N 后缀）> 运行时 git > unknown。
 pub fn harness_git_rev() -> String {
     if let Ok(rev) = std::env::var("AF_OBS_GIT_REV") {
         let rev = rev.trim().to_string();
         if !rev.is_empty() {
             return rev;
+        }
+    }
+    if let Some(rev) = option_env!("AF_GIT_REV") {
+        if !rev.is_empty() {
+            let dirty = option_env!("AF_GIT_DIRTY").unwrap_or("");
+            return if dirty.is_empty() || dirty == "0" {
+                rev.to_string()
+            } else {
+                format!("{rev}-dirty.{dirty}")
+            };
         }
     }
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -319,7 +346,11 @@ impl RunSink {
             .create(true)
             .append(true)
             .open(&path)
-            .map_err(|err| format!("开 {} 失败: {err}", path.display()))?;
+            .map_err(|err| {
+                // 红队⑤：建流失败不留孤儿目录（best-effort 清理，空/非空都不阻塞主流程）。
+                let _ = std::fs::remove_dir_all(&dir);
+                format!("开 {} 失败: {err}", path.display())
+            })?;
         Ok(Self {
             file: Mutex::new(file),
             seq: AtomicU64::new(0),
@@ -329,8 +360,12 @@ impl RunSink {
         })
     }
 
-    /// 写一条事件并 fsync。失败记入 errors（不 panic、不中断跑测），终局统一上报。
+    /// 写一条事件。红队②⑥修复：seq 在文件锁**内**分配（文件顺序与 seq 严格一致）；
+    /// normal 事件只 write+flush 不 fsync（本盘实测 8.195ms/次 fsync×70 事件 ≈0.6s/run
+    /// 的纯主路径税），critical 事件保留 sync_data（终态/重试耗尽/重取是"必须不容错"的行）。
+    /// 失败记入 errors（不 panic、不中断跑测），终局统一上报。
     pub fn write(&self, kind: &str, critical: bool, payload: &Value) {
+        let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         let line = json!({
             "ts_ms": now_ms(),
@@ -341,12 +376,13 @@ impl RunSink {
         });
         let mut text = line.to_string();
         text.push('\n');
-        let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(err) = file
-            .write_all(text.as_bytes())
-            .and_then(|()| file.flush())
-            .and_then(|()| file.sync_data())
-        {
+        let write_res = file.write_all(text.as_bytes()).and_then(|()| file.flush());
+        let write_res = if critical {
+            write_res.and_then(|()| file.sync_data())
+        } else {
+            write_res
+        };
+        if let Err(err) = write_res {
             self.errors
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -382,25 +418,19 @@ impl RunSink {
     }
 }
 
-/// 撕裂行计数：末行无换行、或任何解析失败的行（读侧容忍并告警的口径，与 checker 一致）。
+/// 撕裂行计数（红队⑨统一口径，与 checker 完全一致）：
+/// 任何 JSON 解析失败的行 +1；末行缺换行 +1。两项可叠加。
 pub fn count_torn_lines(data: &[u8]) -> u64 {
     let text = String::from_utf8_lossy(data);
     let mut torn = 0u64;
-    let mut saw_error = false;
-    for (idx, line) in text.split('\n').enumerate() {
+    for line in text.split('\n') {
         if line.is_empty() {
             continue;
         }
         if serde_json::from_str::<Value>(line).is_err() {
             torn += 1;
-            saw_error = true;
-            let _ = idx;
         }
     }
-    if saw_error {
-        return torn;
-    }
-    // 无解析失败时，末行缺换行也算撕裂。
     if !data.is_empty() && !data.ends_with(b"\n") {
         torn += 1;
     }
@@ -459,6 +489,9 @@ pub fn write_batch_manifest(
     event_total: u64,
     status_counts: &Value,
 ) -> Result<PathBuf, String> {
+    // 红队⑦修复：batch_id 与 line/arm/run_id 同过白名单——AF_OBS_BATCH_ID 是环境变量，
+    // 直接拼文件名即可目录穿越写盘，与自称的 D-14/D-22 全段消毒不一致。
+    let batch_id = sanitize_segment(batch_id, "batch_id")?;
     let mut sorted_hashes: Vec<(String, String)> = Vec::new(); // (run_id, events_sha256)
     let index_dir = root.join("index");
     std::fs::create_dir_all(&index_dir).map_err(|err| format!("建 index 失败: {err}"))?;
@@ -602,20 +635,33 @@ impl ResourceSampler {
         let handle = std::thread::Builder::new()
             .name("af-obs-sampler".into())
             .spawn(move || {
-                while !stop2.load(Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_secs(60));
+                // 红队①修复：睡眠切成 250ms 切片、每片后查 stop——stop 置位后 join 最多
+                // 等 250ms，不再吃满 60s 睡眠（实证旧版末次 periodic→final 间隔 61.03s）。
+                // 采样间隔语义不变：距上次采样 ≥60s 才采 periodic。
+                const SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+                const INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+                let mut since_sample = std::time::Duration::ZERO;
+                loop {
                     if stop2.load(Ordering::SeqCst) {
                         break;
                     }
-                    sample_once(
-                        &sink2,
-                        &run_id2,
-                        &host,
-                        &container,
-                        &disk_path,
-                        &peak2,
-                        "periodic",
-                    );
+                    std::thread::sleep(SLICE);
+                    since_sample += SLICE;
+                    if stop2.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if since_sample >= INTERVAL {
+                        since_sample = std::time::Duration::ZERO;
+                        sample_once(
+                            &sink2,
+                            &run_id2,
+                            &host,
+                            &container,
+                            &disk_path,
+                            &peak2,
+                            "periodic",
+                        );
+                    }
                 }
             })
             .ok();

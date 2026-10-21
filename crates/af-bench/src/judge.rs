@@ -343,8 +343,13 @@ pub fn run_judge(
                 };
                 let text = String::from_utf8_lossy(&output.stdout).into_owned();
                 // 判分 stdout JSON 原文 ≤4096 字节（schema 演进期未预见字段的兜底证据）。
+                // 红队⑧修复：按字符边界截断——text[..4096] 在多字节字符中间会 panic 炸掉 bench 进程。
                 run.judge_raw = Some(if text.len() > 4096 {
-                    text[..4096].to_string()
+                    let mut end = 4096;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text[..end].to_string()
                 } else {
                     text.clone()
                 });
