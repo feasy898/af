@@ -63,6 +63,7 @@ impl ToolRegistry {
             None => Err(ToolFailure {
                 error_code: "E_NO_HANDLER".into(),
                 message: format!("没有注册工具 {name}"),
+                output: None,
             }),
         }
     }
@@ -75,10 +76,15 @@ impl Default for ToolRegistry {
 }
 
 /// 工具函数体的失败。这是给止损引擎的事件，不是执行器故障。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `output` 为 Some 时作为工具输出原文落对话（fix4-align-r2：调用方把命令真实
+/// 失败送进 is_error 负反馈通道时，保住命令自己的输出形态，不套 JSON 信封）；
+/// None 时按 `{"error_code","message"}` 信封。is_error 标记两条路都进 API。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolFailure {
     pub error_code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
 }
 
 /// 401 时的密钥重取器：重跑一次密钥解析命令拿新 key。明文只经内存进请求头，
@@ -771,6 +777,7 @@ impl Opened {
                 let failure = serde_json::from_str(&message).unwrap_or(ToolFailure {
                     error_code: "E_EXTERNAL".into(),
                     message,
+                    output: None,
                 });
                 Ok(Dispatch::Done(done_error(call, failure, effect)))
             }
@@ -887,13 +894,16 @@ fn done_error(
     failure: ToolFailure,
     effect: EffectClass,
 ) -> Done {
+    let output = failure.output.unwrap_or_else(|| {
+        json!({
+            "error_code": failure.error_code,
+            "message": failure.message,
+        })
+    });
     Done {
         call_id: call.id.clone(),
         name: call.name.clone(),
-        output: json!({
-            "error_code": failure.error_code,
-            "message": failure.message,
-        }),
+        output,
         is_error: true,
         error_code: failure.error_code,
         effect,
@@ -908,6 +918,7 @@ fn check_schema(tool: &ToolDecl, args: &Value) -> std::result::Result<(), ToolFa
         return Err(ToolFailure {
             error_code: "E_SCHEMA".into(),
             message: format!("工具 {} 的参数必须是对象", tool.name),
+            output: None,
         });
     };
     for item in required {
@@ -918,6 +929,7 @@ fn check_schema(tool: &ToolDecl, args: &Value) -> std::result::Result<(), ToolFa
             return Err(ToolFailure {
                 error_code: "E_SCHEMA".into(),
                 message: format!("工具 {} 缺少参数 {name}", tool.name),
+                output: None,
             });
         }
     }

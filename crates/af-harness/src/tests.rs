@@ -327,6 +327,7 @@ fn fingerprint_streak_stops_the_run() {
         Err(ToolFailure {
             error_code: "E_TIMEOUT".into(),
             message: "超时".into(),
+            output: None,
         })
     });
     tools.register("pay", |_args| Ok(json!({})));
@@ -606,6 +607,45 @@ fn max_turns_stops_before_another_model_call() {
     assert_eq!(report.model_calls, 1);
     assert_eq!(stub.requests().len(), 1);
     assert_eq!(report.turns, 1);
+}
+
+#[test]
+fn tool_failure_with_explicit_output_keeps_raw_observation() {
+    // fix4-align-r2：output=Some 时工具输出保持调用方给的原文形态，
+    // is_error 标记照常为 true（进 anthropic tool_result.is_error 负反馈通道）。
+    let fix = Fixture::new();
+    let stub = StubServer::spawn().unwrap();
+    let mut spec = spec_at(&stub.url());
+    spec.policy.max_turns = 1;
+    spec.policy.stop.completion_signals.clear();
+    spec.policy.stop.tool_free_turn_limit = 8;
+    stub.push(StubResponse::json(
+        200,
+        assistant_calls("", &[("git", json!({"args": "pytest -x"}))]),
+    ));
+    let opened = Opened::open_with_clock(&fix.dir, fix.clock.clone()).unwrap();
+    let mut tools = ToolRegistry::new();
+    tools.register("git", |_args| {
+        Err(ToolFailure {
+            error_code: "exit:1:abc123".into(),
+            message: "4 failed\nexit=1".into(),
+            output: Some(json!("4 failed\nexit=1")),
+        })
+    });
+    let report = opened.run(fix.launch(spec, tools)).unwrap();
+    assert_eq!(report.model_calls, 1);
+    let item = report
+        .transcript
+        .iter()
+        .find(|item| matches!(item, TranscriptItem::Tool { name, .. } if name == "git"));
+    match item {
+        Some(TranscriptItem::Tool {
+            output,
+            is_error: true,
+            ..
+        }) => assert_eq!(output, &json!("4 failed\nexit=1")),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
