@@ -8,7 +8,7 @@
 use crate::error::{redact, Error, Result};
 use std::error::Error as StdError;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 一次 HTTP 响应。非 2xx 也作为 `Ok` 交回调用方，由协议层决定拒绝。
@@ -18,6 +18,22 @@ pub struct HttpResponse {
     pub body: String,
     /// 本次请求在 HTTP 层执行的退避重试次数（不含首次发送）。
     pub retries: u32,
+    /// 末次重试实际采用的 Retry-After 值（毫秒）。无重试或无头时为 None。
+    pub retry_after_ms: Option<u64>,
+    /// 末次重试实际退避睡眠时长（毫秒）。无重试时为 None。
+    pub backoff_ms: Option<u64>,
+}
+
+/// 一次 HTTP 调用的传输层元数据快照（fix4-observability）。
+/// 供事件流回填 `model.call.http_status/retries/retry_after_ms/backoff_ms`：
+/// 成功与失败（含传输层放弃）路径都更新，调用方在 complete_once 返回后读取。
+/// `status=None` 表示传输层失败（没拿到 HTTP 状态行）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HttpCallMeta {
+    pub status: Option<u16>,
+    pub retries: u32,
+    pub retry_after_ms: Option<u64>,
+    pub backoff_ms: Option<u64>,
 }
 
 /// 退避参数。生产默认见 [`RetryConfig::default`]；测试注入短等待。
@@ -58,6 +74,8 @@ pub struct UreqClient {
     retry: RetryConfig,
     /// 本客户端累计退避重试次数。`Opened` 每次打开新建客户端，天然按 Run 分桶。
     retries_done: Arc<AtomicU64>,
+    /// 最近一次 `post_json` 的传输层元数据（成功/失败都更新），事件流回填用。
+    last_meta: Arc<Mutex<HttpCallMeta>>,
 }
 
 impl UreqClient {
@@ -100,12 +118,18 @@ impl UreqClient {
             agent,
             retry,
             retries_done: Arc::new(AtomicU64::new(0)),
+            last_meta: Arc::new(Mutex::new(HttpCallMeta::default())),
         }
     }
 
     /// 本客户端累计的 HTTP 层退避重试次数。
     pub fn retries_done(&self) -> u64 {
         self.retries_done.load(Ordering::Relaxed)
+    }
+
+    /// 最近一次 `post_json` 的元数据快照（fix4-observability：事件行回填用）。
+    pub fn last_call_meta(&self) -> HttpCallMeta {
+        *self.last_meta.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -176,6 +200,17 @@ impl HttpClient for UreqClient {
         secret: &str,
     ) -> Result<HttpResponse> {
         let mut retries: u32 = 0;
+        let mut last_backoff_ms: Option<u64> = None;
+        let record_meta =
+            |status: Option<u16>, retries: u32, after: Option<u64>, backoff: Option<u64>| {
+                let mut meta = self.last_meta.lock().unwrap_or_else(|e| e.into_inner());
+                *meta = HttpCallMeta {
+                    status,
+                    retries,
+                    retry_after_ms: if retries == 0 { None } else { after },
+                    backoff_ms: if retries == 0 { None } else { backoff },
+                };
+            };
         loop {
             let mut request = self.agent.post(url);
             for (name, value) in headers {
@@ -184,9 +219,13 @@ impl HttpClient for UreqClient {
             let (status, text, after) = match request.send_string(body) {
                 Ok(response) => {
                     let status = response.status();
-                    let text = response
-                        .into_string()
-                        .map_err(|err| Error::Transport(redact(&err.to_string(), secret)))?;
+                    let text = match response.into_string() {
+                        Ok(text) => text,
+                        Err(err) => {
+                            record_meta(None, retries, None, last_backoff_ms);
+                            return Err(Error::Transport(redact(&err.to_string(), secret)));
+                        }
+                    };
                     (status, text, None)
                 }
                 Err(ureq::Error::Status(status, response)) => {
@@ -199,22 +238,34 @@ impl HttpClient for UreqClient {
                 }
                 Err(ureq::Error::Transport(err)) => {
                     if !retryable_transport(&err) || retries >= self.retry.max_retries {
+                        // 传输层放弃（不可重试错误或重试耗尽）：元数据无 HTTP 状态行。
+                        record_meta(None, retries, None, last_backoff_ms);
                         return Err(Error::Transport(redact(&err.to_string(), secret)));
                     }
-                    std::thread::sleep(backoff_delay(&self.retry, retries));
+                    let delay = backoff_delay(&self.retry, retries);
+                    last_backoff_ms = Some(delay.as_millis() as u64);
+                    std::thread::sleep(delay);
                     retries += 1;
                     self.retries_done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             };
             if !retryable(status) || retries >= self.retry.max_retries {
+                record_meta(Some(status), retries, after.map(|d| d.as_millis() as u64), last_backoff_ms);
                 return Ok(HttpResponse {
                     status,
                     body: redact(&text, secret),
                     retries,
+                    retry_after_ms: if retries == 0 {
+                        None
+                    } else {
+                        after.map(|d| d.as_millis() as u64)
+                    },
+                    backoff_ms: last_backoff_ms,
                 });
             }
             let delay = after.unwrap_or_else(|| backoff_delay(&self.retry, retries));
+            last_backoff_ms = Some(delay.as_millis() as u64);
             std::thread::sleep(delay);
             retries += 1;
             self.retries_done.fetch_add(1, Ordering::Relaxed);

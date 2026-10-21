@@ -85,6 +85,18 @@ pub struct ToolFailure {
 /// 不进错误文本、不进 trace。返回 Err 表示本次重取失败（照常失败，不无限重试）。
 pub type KeyRefresher = Arc<dyn Fn() -> std::result::Result<String, String> + Send + Sync>;
 
+/// fix4-observability：事件旁观钩子。执行器每写一条 trace 事件（含新增事件）时同步调用，
+/// 参数为 `(kind, critical, payload)`——调用方据此把事件镜像进独立观测存储。
+/// 钩子只观测，不改变执行语义：抛错不可能（返回 ()），执行器不因钩子失败而改道。
+pub type ObsHook = Arc<dyn Fn(&str, bool, &serde_json::Value) + Send + Sync>;
+
+/// 旁观钩子的统一出口：trace 照旧，钩子可选。
+fn obs_emit(launch: &Launch<'_>, kind: &str, critical: bool, payload: &serde_json::Value) {
+    if let Some(obs) = &launch.obs {
+        obs(kind, critical, payload);
+    }
+}
+
 /// 一次 `run` 的输入。父凭证和工单由调用方持有，执行器不把它们落库。
 pub struct Launch<'a> {
     pub spec: AgentSpec,
@@ -95,6 +107,8 @@ pub struct Launch<'a> {
     /// Some 时端点 401（invalid token，如 mcode 令牌 1h 寿命撞长题）重取密钥重试
     /// 该请求一次。可靠性修复，不改测量语义：不重置对话/预算/轮次。
     pub key_refresh: Option<KeyRefresher>,
+    /// fix4-observability：事件旁观钩子（见 [`ObsHook`]）。None 时行为与旧版完全一致。
+    pub obs: Option<ObsHook>,
     pub parent: &'a Biscuit,
     pub public_key: &'a PublicKey,
     pub namespace: String,
@@ -276,6 +290,8 @@ struct Live {
     transcript: Vec<TranscriptItem>,
     /// 当前生效密钥。401 重取成功后在此换新，后续轮次直接用（旧 key 已死不再碰）。
     key: EndpointKey,
+    /// fix4-observability：本 run 已执行的密钥重取次数（key.refresh.attempt 计数位）。
+    key_refresh_attempts: u32,
 }
 
 enum TurnOutcome {
@@ -319,6 +335,10 @@ struct Done {
     is_error: bool,
     error_code: String,
     effect: EffectClass,
+    /// fix4-observability：工具执行墙钟（毫秒）。由 run_tools 在 dispatch 外计时回填。
+    wall_ms: u64,
+    /// fix4-observability：失败时错误输出头部摘录（≤300 字符）；成功为 None。
+    error_head: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -370,6 +390,7 @@ impl Opened {
             budget,
             transcript,
             key: launch.key.clone(),
+            key_refresh_attempts: 0,
         })
     }
 
@@ -417,13 +438,13 @@ impl Opened {
                 return report_of(&live.row, status);
             }
             if live.row.turn_index >= max_turns {
-                return self.finish(live, RunStatus::MaxTurns);
+                return self.finish(launch, live, RunStatus::MaxTurns);
             }
             if let Err(fault) = live.budget.probe(per_turn, self.clock.wall_ms()) {
-                return self.finish(live, RunStatus::BudgetExhausted { fault });
+                return self.finish(launch, live, RunStatus::BudgetExhausted { fault });
             }
             match self.one_turn(launch, live)? {
-                TurnOutcome::Terminal(status) => return self.finish(live, status),
+                TurnOutcome::Terminal(status) => return self.finish(launch, live, status),
                 TurnOutcome::Interrupted => {
                     return Err(Error::Interrupted {
                         run_id: live.row.run_id.clone(),
@@ -464,6 +485,9 @@ impl Opened {
         request.push(TranscriptItem::System { text: system });
         request.extend(live.transcript.iter().cloned());
         let tools = visible_tools(&launch.spec, &live.cred.tools);
+        // fix4-observability：墙钟与重取标志——wall_ms 只盖本次模型调用（含 HTTP 层重试）。
+        let call_started = std::time::Instant::now();
+        let mut key_refreshed = false;
         let message = match complete_once(
             &self.http,
             &launch.spec.endpoint,
@@ -474,24 +498,42 @@ impl Opened {
             Err(Error::Endpoint {
                 status: 401,
                 message,
-            }) => self.retry_with_fresh_key(launch, live, &request, &tools, 401, message)?,
+            }) => {
+                let (msg, refreshed) =
+                    self.retry_with_fresh_key(launch, live, &request, &tools, 401, message)?;
+                key_refreshed = refreshed;
+                msg
+            }
+            // 传输层失败 / HTTP 层重试耗尽：落 harness.retry_exhausted（critical）后照旧上抛。
+            Err(err) => {
+                self.trace_retry_exhausted(launch, live, &err);
+                return Err(err);
+            }
             other => other?,
         };
+        let call_wall_ms = call_started.elapsed().as_millis() as u64;
         live.row.model_calls = live.row.model_calls.saturating_add(1);
-        self.trace.write_normal(
-            "harness.model",
-            json!({
-                "run_id": live.row.run_id,
-                "turn": live.row.turn_index,
-                "model": launch.spec.endpoint.model,
-                "finish": message.finish,
-                "usage": message.usage.map(|u| json!({
-                    "input_tokens": u.input_tokens,
-                    "output_tokens": u.output_tokens,
-                    "cache_read_tokens": u.cache_read_tokens,
-                })),
-            }),
-        );
+        let meta = self.http.last_call_meta();
+        let model_payload = json!({
+            "run_id": live.row.run_id,
+            "turn": live.row.turn_index,
+            "model": launch.spec.endpoint.model,
+            "finish": message.finish,
+            "usage": message.usage.map(|u| json!({
+                "input_tokens": u.input_tokens,
+                "output_tokens": u.output_tokens,
+                "cache_read_tokens": u.cache_read_tokens,
+            })),
+            // fix4-observability 六个新字段：时延/HTTP 状态/重试画像/401 重取标记。
+            "wall_ms": call_wall_ms,
+            "http_status": meta.status,
+            "retries": meta.retries,
+            "retry_after_ms": meta.retry_after_ms,
+            "backoff_ms": meta.backoff_ms,
+            "key_refreshed": key_refreshed,
+        });
+        self.trace.write_normal("harness.model", model_payload.clone());
+        obs_emit(launch, "harness.model", false, &model_payload);
         let finish = message.finish.clone();
         live.transcript.push(TranscriptItem::Assistant {
             text: message.text,
@@ -539,14 +581,35 @@ impl Opened {
         tools: &[ToolDecl],
         status: u16,
         message: String,
-    ) -> Result<ModelMessage> {
+    ) -> Result<(ModelMessage, bool)> {
         let fail = |message: String| Error::Endpoint { status, message };
         let Some(refresher) = &launch.key_refresh else {
             return Err(fail(message));
         };
+        live.key_refresh_attempts = live.key_refresh_attempts.saturating_add(1);
+        let attempt = live.key_refresh_attempts;
+        // fix4-observability：harness.key_refresh 升为 critical（D-5 401 重取留痕），
+        // 携带 reason/attempt/ok——ok 只落布尔不落密钥值（密钥零明文纪律）。
+        let emit_refresh = |ok: bool| -> Value {
+            let payload = json!({
+                "run_id": live.row.run_id,
+                "turn": live.row.turn_index,
+                "reason": "401",
+                "attempt": attempt,
+                "ok": ok,
+            });
+            if let Err(err) = self.trace.write_critical("harness.key_refresh", payload.clone()) {
+                // critical 落盘失败不能吞掉原有 401 处理路径：记录后继续，
+                // 该失败会在 trace shutdown 时以 PersistFailed 显形。
+                eprintln!("[harness] key_refresh critical 落盘失败: {err}");
+            }
+            obs_emit(launch, "harness.key_refresh", true, &payload);
+            payload
+        };
         let fresh = match refresher() {
             Ok(key) => key,
             Err(err) => {
+                emit_refresh(false);
                 return Err(fail(format!(
                     "{message}；[401 后重取密钥失败: {}]",
                     err.chars().take(160).collect::<String>()
@@ -554,23 +617,44 @@ impl Opened {
             }
         };
         if fresh == live.key.expose() {
+            emit_refresh(true);
             return Err(fail(format!(
                 "{message}；[401 后重取密钥与旧密钥相同，判定密钥面无变化，不再重试]"
             )));
         }
         let key = EndpointKey::new(fresh);
-        self.trace.write_normal(
-            "harness.key_refresh",
-            json!({
-                "run_id": live.row.run_id,
-                "turn": live.row.turn_index,
-                "reason": "endpoint_401",
-                "retried": true,
-            }),
-        );
+        emit_refresh(true);
         let outcome = complete_once(&self.http, &launch.spec.endpoint, &key, request, tools);
         live.key = key;
-        outcome
+        outcome.map(|message| (message, true))
+    }
+
+    /// fix4-observability：HTTP 层重试耗尽 / 传输层放弃的 critical 留痕（R5 败因分流）。
+    /// 只对"耗尽"形态发事件：传输层错误、或可重试状态码（429/5xx）的端点错误；
+    /// 401 走 key_refresh 留痕，其余 4xx 是请求本身的问题、无重试发生，不发。
+    fn trace_retry_exhausted(&self, launch: &Launch<'_>, live: &Live, err: &Error) {
+        let (err_class, http_status) = match err {
+            Error::Transport(_) => ("transport", None),
+            Error::Endpoint { status, .. } if matches!(status, 429 | 500 | 502 | 503 | 504) => {
+                ("http", Some(*status))
+            }
+            _ => return,
+        };
+        let meta = self.http.last_call_meta();
+        let payload = json!({
+            "run_id": live.row.run_id,
+            "model": launch.spec.endpoint.model,
+            "err_class": err_class,
+            "http_status": http_status,
+            "retries_done": self.http.retries_done(),
+            "retry_after_ms": meta.retry_after_ms,
+            "backoff_ms": meta.backoff_ms,
+        });
+        if let Err(trace_err) = self.trace.write_critical("harness.retry_exhausted", payload.clone())
+        {
+            eprintln!("[harness] retry_exhausted critical 落盘失败: {trace_err}");
+        }
+        obs_emit(launch, "harness.retry_exhausted", true, &payload);
     }
 
     fn settle_turn(
@@ -583,7 +667,7 @@ impl Opened {
     ) -> Result<TurnOutcome> {
         if let Err(fault) = live.budget.charge(per_turn, self.clock.wall_ms()) {
             if let Some(decision) = &pass.latched {
-                self.trace_stop(&live.row, decision)?;
+                self.trace_stop(launch, &live.row, decision)?;
             }
             return Ok(TurnOutcome::Terminal(RunStatus::BudgetExhausted { fault }));
         }
@@ -591,7 +675,7 @@ impl Opened {
             return Ok(TurnOutcome::Terminal(status));
         }
         if let Some(decision) = pass.latched {
-            self.trace_stop(&live.row, &decision)?;
+            self.trace_stop(launch, &live.row, &decision)?;
             return Ok(TurnOutcome::Terminal(RunStatus::Stopped { decision }));
         }
         // fix2 完成判定（mini-swe-agent has_finished 同源）：完成信号必须由一个
@@ -625,11 +709,16 @@ impl Opened {
             if denied.is_some() {
                 break;
             }
-            match self.dispatch(launch, live, index, call)? {
+            // fix4-observability：工具墙钟在 dispatch 外计时（含授权/ schema/执行）。
+            let tool_started = std::time::Instant::now();
+            let dispatched = self.dispatch(launch, live, index, call);
+            let wall_ms = tool_started.elapsed().as_millis() as u64;
+            match dispatched? {
                 Dispatch::Denied(status) => denied = Some(status),
-                Dispatch::Done(done) => {
+                Dispatch::Done(mut done) => {
+                    done.wall_ms = wall_ms;
                     outputs.push(output_text(&done.output));
-                    self.record_tool(live, done, &mut latched);
+                    self.record_tool(launch, live, done, &mut latched);
                 }
             }
         }
@@ -640,7 +729,13 @@ impl Opened {
         })
     }
 
-    fn record_tool(&self, live: &mut Live, done: Done, latched: &mut Option<Decision>) {
+    fn record_tool(
+        &self,
+        launch: &Launch<'_>,
+        live: &mut Live,
+        done: Done,
+        latched: &mut Option<Decision>,
+    ) {
         let event = if done.is_error {
             Event::ToolError {
                 tool: done.name.clone(),
@@ -651,17 +746,19 @@ impl Opened {
                 tool: done.name.clone(),
             }
         };
-        self.trace.write_normal(
-            "harness.tool",
-            json!({
-                "run_id": &live.row.run_id,
-                "turn": live.row.turn_index,
-                "tool": &done.name,
-                "effect": effect_label(done.effect),
-                "is_error": done.is_error,
-                "error_code": &done.error_code,
-            }),
-        );
+        let tool_payload = json!({
+            "run_id": &live.row.run_id,
+            "turn": live.row.turn_index,
+            "tool": &done.name,
+            "effect": effect_label(done.effect),
+            "is_error": done.is_error,
+            "error_code": &done.error_code,
+            // fix4-observability：工具墙钟 + 错误头部摘录（error_code 不足时的人读线索）。
+            "wall_ms": done.wall_ms,
+            "error_head": done.error_head,
+        });
+        self.trace.write_normal("harness.tool", tool_payload.clone());
+        obs_emit(launch, "harness.tool", false, &tool_payload);
         live.transcript.push(TranscriptItem::Tool {
             call_id: done.call_id,
             name: done.name,
@@ -778,8 +875,13 @@ impl Opened {
         }
     }
 
-    fn finish(&self, live: &mut Live, status: RunStatus) -> Result<RunReport> {
-        self.trace_terminal(&live.row, &status)?;
+    fn finish(
+        &self,
+        launch: &Launch<'_>,
+        live: &mut Live,
+        status: RunStatus,
+    ) -> Result<RunReport> {
+        self.trace_terminal(launch, &live.row, &status)?;
         live.row.terminal_json = Some(serde_json::to_string(&status)?);
         self.persist(live)?;
         report_of(&live.row, status)
@@ -796,37 +898,44 @@ impl Opened {
         Ok(())
     }
 
-    fn trace_terminal(&self, row: &RunRecord, status: &RunStatus) -> Result<()> {
+    fn trace_terminal(&self, launch: &Launch<'_>, row: &RunRecord, status: &RunStatus) -> Result<()> {
         let kind = match status {
             RunStatus::BudgetExhausted { .. } => "harness.budget",
             RunStatus::Unauthorized { .. } => "harness.unauthorized",
             _ => "harness.stop",
         };
+        let payload = json!({
+            "run_id": row.run_id,
+            "turn": row.turn_index,
+            "status": status,
+        });
         self.trace
-            .write_critical(
-                kind,
-                json!({
-                    "run_id": row.run_id,
-                    "turn": row.turn_index,
-                    "status": status,
-                }),
-            )
+            .write_critical(kind, payload.clone())
             .map_err(|err| Error::Trace(err.to_string()))?;
+        obs_emit(launch, kind, true, &payload);
         Ok(())
     }
 
-    fn trace_stop(&self, row: &RunRecord, decision: &Decision) -> Result<()> {
+    fn trace_stop(&self, launch: &Launch<'_>, row: &RunRecord, decision: &Decision) -> Result<()> {
+        let payload = json!({
+            "run_id": row.run_id,
+            "turn": row.turn_index,
+            "decision": decision,
+        });
         self.trace
-            .write_critical(
-                "harness.stop",
-                json!({
-                    "run_id": row.run_id,
-                    "turn": row.turn_index,
-                    "decision": decision,
-                }),
-            )
+            .write_critical("harness.stop", payload.clone())
             .map_err(|err| Error::Trace(err.to_string()))?;
+        obs_emit(launch, "harness.stop", true, &payload);
         Ok(())
+    }
+
+    /// fix4-observability：读取某 run 的进度行（轮次/调用数/副作用计数）。
+    /// run 以 Err 收场（run_failed）时报告不存在，af-bench 据此回填 run.finished。
+    pub fn run_progress(&self, run_id: &str) -> Result<Option<(u32, u64, u64, u64)>> {
+        Ok(self
+            .store
+            .load(run_id)?
+            .map(|row| (row.turn_index, row.model_calls, row.effect_fresh, row.effect_replays)))
     }
 }
 
@@ -879,6 +988,8 @@ fn done_ok(call: &crate::endpoint::ParsedToolCall, output: Value, effect: Effect
         is_error: false,
         error_code: String::new(),
         effect,
+        wall_ms: 0,
+        error_head: None,
     }
 }
 
@@ -895,8 +1006,10 @@ fn done_error(
             "message": failure.message,
         }),
         is_error: true,
+        error_head: Some(failure.message.chars().take(300).collect::<String>()),
         error_code: failure.error_code,
         effect,
+        wall_ms: 0,
     }
 }
 

@@ -90,6 +90,7 @@ impl Fixture {
             user_message: "开始".into(),
             key: EndpointKey::new("sk-test-secret"),
             key_refresh: None,
+            obs: None,
             parent: &self.token,
             public_key: &self.public_key,
             namespace: "line-a".into(),

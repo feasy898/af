@@ -14,6 +14,29 @@ use std::process::Command;
 use crate::judge;
 use crate::tb;
 
+/// fix4-observability：harness.judge 事件的全字段载体（红队④的实际分派位在此钉死）。
+/// judge_mode_actual 与 run.started.judge_mode_declared 不等即判分无效。
+#[derive(Debug, Clone, Default)]
+pub struct JudgeDetail {
+    pub resolved: Option<bool>,
+    pub note: String,
+    pub eval_sha256: Option<String>,
+    pub eval_timeout: bool,
+    pub judge_exit_code: Option<i32>,
+    pub judge_stderr: Option<String>,
+    pub judge_raw: Option<String>,
+    pub log_parsed: Option<bool>,
+    pub tests_collected: Option<u32>,
+    pub env_yml_synthesized: Option<bool>,
+    pub f2p_pass: Option<u32>,
+    pub f2p_total: Option<u32>,
+    pub p2p_pass: Option<u32>,
+    pub p2p_total: Option<u32>,
+    pub swebench_version: Option<String>,
+    pub judge_container: Option<String>,
+    pub judge_mode_actual: &'static str,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SwevTask {
     pub instance_id: String,
@@ -140,8 +163,8 @@ pub fn diff_touches_tests(diff: &str) -> Vec<String> {
 
 /// 判分（原地模式）：取证 diff → 写入 eval 脚本 → **agent 容器内**执行 → 本地官方判分。
 /// `task_json_path` 是 swev-prep 产出的原始任务包（判分器全字段来源）。
-/// 返回 (resolved, note, eval_sha256)——eval_sha256 是判分日志的字节指纹
-/// （D-20 项 2：判分可追溯；桥接/判分早期失败时为 None）。
+/// fix4-observability：返回结构化 [`JudgeDetail`]（eval 超时位升为独立字段，
+/// 不再折叠进 note 字符串；判分容器=agent 容器，judge_mode_actual="in-place"）。
 ///
 /// POC-1：原地模式是**对照组**，默认判分走 `verify_clean`（干净容器）。
 /// 原地模式保留是因为判分语义变更需要对照口径，不能直接把旧路删掉。
@@ -151,15 +174,21 @@ pub fn verify(
     task: &SwevTask,
     work_dir: &Path,
     task_json_path: &Path,
-) -> (Option<bool>, String, Option<String>) {
-    let _agent_diff = match capture_diff(host, env, work_dir) {
-        Ok(d) => d,
-        Err(err) => return (None, err, None),
+) -> JudgeDetail {
+    let mut detail = JudgeDetail {
+        judge_mode_actual: "in-place",
+        judge_container: Some(env.container.clone()),
+        ..JudgeDetail::default()
     };
+    if let Err(err) = capture_diff(host, env, work_dir) {
+        detail.note = err;
+        return detail;
+    }
     let diff_path = work_dir.join("agent.diff");
     let eval_path = work_dir.join("eval.sh");
-    if std::fs::write(&eval_path, &task.eval_script).is_err() {
-        return (None, "写 eval.sh 失败".into(), None);
+    if let Err(err) = std::fs::write(&eval_path, &task.eval_script) {
+        detail.note = format!("写 eval.sh 失败: {err}");
+        return detail;
     }
     // eval 脚本经 stdin 喂给容器 bash，避免 docker cp 往返。
     // stderr 必须并入日志：set -x 轨迹与 START/END 标记走 stderr，官方判分需要。
@@ -187,14 +216,16 @@ pub fn verify(
         ))
         .stderr(std::process::Stdio::null())
         .status();
-    let mut eval_timed_out = false;
     match status {
-        Err(err) => return (None, format!("eval 执行桥接失败: {err}"), None),
+        Err(err) => {
+            detail.note = format!("eval 执行桥接失败: {err}");
+            return detail;
+        }
         Ok(st) => {
             if st.code() == Some(124) {
                 // D-20 项 4：timeout 击杀显式化——在日志末尾落标记行，
                 // 不再留无标记截断日志（判分复核据此与"截断/失败日志"灰区区分）。
-                eval_timed_out = true;
+                detail.eval_timeout = true;
                 let marker = format!("\nEVAL_TIMEOUT_KILLED {EVAL_TIMEOUT_SEC}\n");
                 if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&log_path) {
                     use std::io::Write as _;
@@ -204,16 +235,29 @@ pub fn verify(
         }
     }
     // D-20 项 2：判分时计算日志指纹（含超时标记行——哈希的是判分器实际读到的字节）。
-    let eval_sha256 = judge::sha256_hex(&log_path);
+    detail.eval_sha256 = judge::sha256_hex(&log_path);
     // POC-3（仅 af 内半边）：判分器调用失败退避重试 2 次——供给面抖动
     // （urllib3 Traceback / 连接重置）不再直接判成 run 失败。
-    let (resolved, judge_note) = judge::run_judge(task_json_path, &log_path, &diff_path);
-    let timeout_note = if eval_timed_out {
+    let (run, judge_note) = judge::run_judge(task_json_path, &log_path, &diff_path);
+    detail.resolved = run.resolved;
+    detail.judge_exit_code = run.judge_exit_code;
+    detail.judge_stderr = run.judge_stderr;
+    detail.judge_raw = run.judge_raw;
+    detail.log_parsed = run.log_parsed;
+    detail.tests_collected = run.tests_collected;
+    detail.env_yml_synthesized = run.env_yml_synthesized;
+    detail.f2p_pass = run.f2p_pass;
+    detail.f2p_total = run.f2p_total;
+    detail.p2p_pass = run.p2p_pass;
+    detail.p2p_total = run.p2p_total;
+    detail.swebench_version = run.swebench_version;
+    let timeout_note = if detail.eval_timeout {
         format!("eval 超时击杀（已落标记 {EVAL_TIMEOUT_SEC}s）；")
     } else {
         String::new()
     };
-    (resolved, format!("{timeout_note}{judge_note}"), eval_sha256)
+    detail.note = format!("{timeout_note}{judge_note}");
+    detail
 }
 
 /// 判分（干净容器模式，POC-1 默认）：取证 diff → **全新 eval 容器**（无代理环境变量）
@@ -232,15 +276,37 @@ pub fn verify_clean(
     task: &SwevTask,
     work_dir: &Path,
     task_json_path: &Path,
-) -> (Option<bool>, String, Option<String>) {
+) -> JudgeDetail {
     // 取证 diff 仍在 agent 容器里取（改动事实来自 agent 的工作区），
     // 但**判分**搬进干净容器。
     if let Err(err) = capture_diff(host, env, work_dir) {
-        return (None, err, None);
+        return JudgeDetail {
+            judge_mode_actual: "clean",
+            note: err,
+            ..JudgeDetail::default()
+        };
     }
     let diff_path = work_dir.join("agent.diff");
     let verdict = judge::verify_clean(task, &diff_path, work_dir, task_json_path);
-    (verdict.resolved, verdict.note, verdict.eval_sha256)
+    JudgeDetail {
+        resolved: verdict.resolved,
+        note: verdict.note,
+        eval_sha256: verdict.eval_sha256,
+        eval_timeout: verdict.eval_timeout,
+        judge_exit_code: verdict.judge_run.judge_exit_code,
+        judge_stderr: verdict.judge_run.judge_stderr,
+        judge_raw: verdict.judge_run.judge_raw,
+        log_parsed: verdict.judge_run.log_parsed,
+        tests_collected: verdict.judge_run.tests_collected,
+        env_yml_synthesized: verdict.judge_run.env_yml_synthesized,
+        f2p_pass: verdict.judge_run.f2p_pass,
+        f2p_total: verdict.judge_run.f2p_total,
+        p2p_pass: verdict.judge_run.p2p_pass,
+        p2p_total: verdict.judge_run.p2p_total,
+        swebench_version: verdict.judge_run.swebench_version,
+        judge_container: verdict.judge_container,
+        judge_mode_actual: "clean",
+    }
 }
 
 fn tb_ssh(host: &str, script: &str, timeout_sec: u32) -> Result<(bool, String), String> {

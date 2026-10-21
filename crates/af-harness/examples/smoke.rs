@@ -110,6 +110,7 @@ fn smoke() -> Result<(), Box<dyn std::error::Error>> {
         user_message: "ping".into(),
         key: EndpointKey::new(api_key),
         key_refresh: None,
+        obs: None,
         parent: &root.token,
         public_key: &public_key,
         namespace: "line-a".into(),
