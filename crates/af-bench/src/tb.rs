@@ -98,6 +98,11 @@ pub struct TbEnv {
     pub workdir: String,
 }
 
+/// bash 工具单条命令的默认超时（秒）——历史口径，缺省不变。
+pub const DEFAULT_BASH_TIMEOUT_SEC: u32 = 180;
+/// bash 工具单条命令的超时上限（秒）——硬上限，超出即被裁到此处。
+pub const MAX_BASH_TIMEOUT_SEC: u32 = 600;
+
 impl TbEnv {
     /// 建环境与容器。任务目录须已在 anolis:/data/bench/tb/<task>。
     pub fn setup(host: &str, task: &TbTask, profile: &str) -> Result<Self, String> {
@@ -161,13 +166,19 @@ impl TbEnv {
     ///   · 桥接失败 → 声明"基建瞬断、可重试"，同样不死；
     ///   · 普通非零退出不教学（失败是常态信号，逐条指点只会加噪）；
     ///   · 截断附「换窄命令」指引（mini observation_template 同源）。
-    pub fn exec(&self, command: &str) -> String {
+    ///
+    /// POC-2：超时不再写死 180s——由工具入参 `timeout_ms` 决定（缺省 180s、上限 600s）。
+    /// 改不动的是"被杀"这件事本身，所以恢复文案里**不再教**模型用 `timeout <secs>`
+    /// 包长任务（任何 secs>180 的写法都会被 harness 自己的硬上限砍掉，教了就是骗模型）：
+    /// 改成教"重定向到文件再分段读"，并把 180s/600s 两个真实数字写进文案。
+    pub fn exec(&self, command: &str, timeout_sec: u32) -> String {
+        let timeout_sec = timeout_sec.clamp(1, MAX_BASH_TIMEOUT_SEC);
         let script = format!(
             "docker exec {} bash -lc {}; echo __AF_RC=$?",
             self.container,
             shell_quote(&format!("cd {} && {}", self.workdir, command))
         );
-        let (mut text, rc) = match ssh(&self.host, &script, 180) {
+        let (mut text, rc) = match ssh(&self.host, &script, timeout_sec) {
             Ok((_, raw)) => split_rc(&raw),
             Err(err) => {
                 return format!(
@@ -177,9 +188,9 @@ impl TbEnv {
             }
         };
         if rc.is_none() {
-            text.push_str(
-                "\n[harness] The command was killed after exceeding the 180s timeout (no exit code was reported). Partial output (if any) is above. Re-run with a different approach: pipe input or use non-interactive flags (-y / -n / DEBIAN_FRONTEND=noninteractive), wrap long work in an explicit `timeout <secs> ...`, and avoid commands that never exit on their own (servers, watch loops, pagers).",
-            );
+            text.push_str(&format!(
+                "\n[harness] The command was killed after exceeding the {timeout_sec}s timeout (no exit code was reported). Partial output (if any) is above. Note: the harness enforces a hard cap of {MAX_BASH_TIMEOUT_SEC}s per command, so wrapping the command in `timeout <secs>` cannot extend it. To run long jobs, redirect the output to a file and read it back in parts: `cmd > /tmp/out.txt 2>&1; tail -40 /tmp/out.txt` — then poll the file with a short command. You can also ask for a longer timeout on the next call with the `timeout_ms` parameter (default {DEFAULT_BASH_TIMEOUT_SEC}000 ms, max {MAX_BASH_TIMEOUT_SEC}000 ms). Also use non-interactive flags (-y / -n / DEBIAN_FRONTEND=noninteractive) and avoid commands that never exit on their own (servers, watch loops, pagers).",
+            ));
         }
         const CAP: usize = 12_000;
         if text.len() > CAP {
@@ -286,14 +297,20 @@ fn tail(text: &str, cap: usize) -> String {
 /// 避免"工具描述说 /app、实际在 /testbed"的目录矛盾（S0 零补丁缺陷嫌疑之一）。
 /// fix2：描述补防错条款（mcode 式"把失败模式写进描述"）——新 shell 语义、
 /// 非交互要求、超时行为、exit 行在末尾（首行留给命令输出，配合提交式完成判定）。
+/// POC-2：入参加 `timeout_ms`（缺省 180s、上限 600s）——长测试套件可以显式要更久，
+/// 不用再靠"命令内 timeout <secs>"去撞 harness 自己的硬上限。
 pub fn bash_tool_decl(workdir: &str) -> Value {
     json!({
         "name": "bash",
-        "description": format!("Execute a bash command in the task environment (a Linux container). Every command runs in a fresh non-interactive shell with the working directory set to {workdir}; shell state (cd, exported variables) does not persist between commands. Interactive commands (editors, prompts) and commands that never exit are killed by a timeout — use non-interactive flags. The tool returns the command's output followed by a final `exit=<code>` line. Use it to inspect, modify, build and test."),
+        "description": format!("Execute a bash command in the task environment (a Linux container). Every command runs in a fresh non-interactive shell with the working directory set to {workdir}; shell state (cd, exported variables) does not persist between commands. Interactive commands (editors, prompts) and commands that never exit are killed by a timeout — use non-interactive flags. The tool returns the command's output followed by a final `exit=<code>` line. Use it to inspect, modify, build and test. Each call is killed after {DEFAULT_BASH_TIMEOUT_SEC}s by default; pass timeout_ms (max {MAX_BASH_TIMEOUT_SEC}000) for long-running commands such as a full test suite — the harness cap is hard, so `timeout <secs>` inside the command cannot extend it; for very long jobs, redirect output to a file and read it back in parts."),
         "parameters": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "The bash command to execute."}
+                "command": {"type": "string", "description": "The bash command to execute."},
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": format!("Timeout for this command in milliseconds. Default {DEFAULT_BASH_TIMEOUT_SEC}000, maximum {MAX_BASH_TIMEOUT_SEC}000. Use a larger value for long test suites; the command is killed when the timeout expires.")
+                }
             },
             "required": ["command"]
         },

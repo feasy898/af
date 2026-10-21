@@ -11,6 +11,7 @@ use serde::Deserialize;
 use std::path::Path;
 use std::process::Command;
 
+use crate::judge;
 use crate::tb;
 
 #[derive(Debug, Deserialize)]
@@ -132,10 +133,13 @@ pub fn diff_touches_tests(diff: &str) -> Vec<String> {
     hits
 }
 
-/// 判分：取证 diff → 写入 eval 脚本 → 容器内执行 → 本地官方判分。
+/// 判分（原地模式）：取证 diff → 写入 eval 脚本 → **agent 容器内**执行 → 本地官方判分。
 /// `task_json_path` 是 swev-prep 产出的原始任务包（判分器全字段来源）。
 /// 返回 (resolved, note, eval_sha256)——eval_sha256 是判分日志的字节指纹
 /// （D-20 项 2：判分可追溯；桥接/判分早期失败时为 None）。
+///
+/// POC-1：原地模式是**对照组**，默认判分走 `verify_clean`（干净容器）。
+/// 原地模式保留是因为判分语义变更需要对照口径，不能直接把旧路删掉。
 pub fn verify(
     host: &str,
     env: &tb::TbEnv,
@@ -195,68 +199,43 @@ pub fn verify(
         }
     }
     // D-20 项 2：判分时计算日志指纹（含超时标记行——哈希的是判分器实际读到的字节）。
-    let eval_sha256 = sha256_hex(&log_path);
-    let judge = Command::new("/home/pan-ding/swev-venv/bin/python")
-        .arg("/home/pan-ding/workspace/agent黑灯工厂/tools/swev-judge.py")
-        .arg(task_json_path)
-        .arg(&log_path)
-        .arg(&diff_path)
-        .output();
-    match judge {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            match serde_json::from_str::<serde_json::Value>(text.trim()) {
-                Ok(row) => {
-                    let resolved = row.get("resolved").and_then(serde_json::Value::as_bool);
-                    // D-20 项 3 消费端：judge JSON 带 log_parsed 时在 note 前缀如实透传
-                    // （截断日志的判 false 与"真失败"不再同貌）。
-                    let parsed_note = match row.get("log_parsed") {
-                        Some(serde_json::Value::Bool(false)) => "[log_parsed=false] ".to_string(),
-                        _ => String::new(),
-                    };
-                    let timeout_note = if eval_timed_out {
-                        format!("eval 超时击杀（已落标记 {EVAL_TIMEOUT_SEC}s）；")
-                    } else {
-                        String::new()
-                    };
-                    (
-                        resolved,
-                        format!("{timeout_note}{parsed_note}judge: {}", text.trim()),
-                        eval_sha256,
-                    )
-                }
-                Err(err) => (
-                    None,
-                    format!(
-                        "judge 输出不是 JSON: {err}: {}",
-                        &text[..text.len().min(200)]
-                    ),
-                    eval_sha256,
-                ),
-            }
-        }
-        Ok(output) => (
-            None,
-            format!(
-                "judge 退出 {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-                    .chars()
-                    .take(300)
-                    .collect::<String>()
-            ),
-            eval_sha256,
-        ),
-        Err(err) => (None, format!("judge 启动失败: {err}"), eval_sha256),
-    }
+    let eval_sha256 = judge::sha256_hex(&log_path);
+    // POC-3（仅 af 内半边）：判分器调用失败退避重试 2 次——供给面抖动
+    // （urllib3 Traceback / 连接重置）不再直接判成 run 失败。
+    let (resolved, judge_note) = judge::run_judge(task_json_path, &log_path, &diff_path);
+    let timeout_note = if eval_timed_out {
+        format!("eval 超时击杀（已落标记 {EVAL_TIMEOUT_SEC}s）；")
+    } else {
+        String::new()
+    };
+    (resolved, format!("{timeout_note}{judge_note}"), eval_sha256)
 }
 
-/// eval.log 的 sha256 十六进制串；读不到文件时 None（D-20 项 2）。
-fn sha256_hex(path: &Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let data = std::fs::read(path).ok()?;
-    let digest = Sha256::digest(&data);
-    Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+/// 判分（干净容器模式，POC-1 默认）：取证 diff → **全新 eval 容器**（无代理环境变量）
+/// 应用补丁 → 跑官方 eval_script → 本地官方判分。
+///
+/// 与原地模式的差异（这是「判分搬干净容器」的语义变更）：
+/// - 判分容器不是 agent 容器：agent 装的依赖、留的未跟踪文件都不进判分；
+/// - 判分容器不带代理环境变量：eval_script 的 `pip install .` 与 P2P 断言
+///   看到的是默认网络环境，不再被出网代理劫持。
+///
+/// 干净判分只落本机 docker（anolis 容器出网依赖代理，注入即污染），
+/// 因此本函数的容器操作不经 --host 桥接。
+pub fn verify_clean(
+    host: &str,
+    env: &tb::TbEnv,
+    task: &SwevTask,
+    work_dir: &Path,
+    task_json_path: &Path,
+) -> (Option<bool>, String, Option<String>) {
+    // 取证 diff 仍在 agent 容器里取（改动事实来自 agent 的工作区），
+    // 但**判分**搬进干净容器。
+    if let Err(err) = capture_diff(host, env, work_dir) {
+        return (None, err, None);
+    }
+    let diff_path = work_dir.join("agent.diff");
+    let verdict = judge::verify_clean(task, &diff_path, work_dir, task_json_path);
+    (verdict.resolved, verdict.note, verdict.eval_sha256)
 }
 
 fn tb_ssh(host: &str, script: &str, timeout_sec: u32) -> Result<(bool, String), String> {

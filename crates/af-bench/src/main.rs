@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+mod judge;
 mod swev;
 mod tb;
 
@@ -86,6 +87,10 @@ struct Args {
     trial: bool,
     tasks: Vec<String>,
     host: String,
+    /// POC-1：判分模式 clean=全新 eval 容器（默认）/ in-place=agent 容器内原地判（对照组）。
+    judge_mode: String,
+    /// POC-1：swev-rejudge 的存量 run 根目录。
+    from: PathBuf,
 }
 
 impl Args {
@@ -100,6 +105,8 @@ impl Args {
         let mut trial = false;
         let mut tasks = Vec::new();
         let mut host = "anolis".to_string();
+        let mut judge_mode = "clean".to_string();
+        let mut from = PathBuf::new();
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -135,13 +142,16 @@ impl Args {
                         .collect()
                 }
                 "--host" => host = it.next().ok_or("--host 缺值")?,
+                "--judge-mode" => judge_mode = it.next().ok_or("--judge-mode 缺值")?,
+                "--from" => from = PathBuf::from(it.next().ok_or("--from 缺值")?),
                 other => return Err(format!("未知参数 {other}")),
             }
         }
         Ok(Self {
             suite: suite.ok_or("缺 --suite")?,
             data_root: data_root.ok_or("缺 --data-root")?,
-            profile: profile.ok_or("缺 --profile")?,
+            // --profile 只有跑批套件需要；swev-rejudge 从 run 目录名里读档案名。
+            profile: profile.unwrap_or_default(),
             case_file,
             limit,
             offset,
@@ -149,7 +159,22 @@ impl Args {
             trial,
             tasks,
             host,
+            judge_mode,
+            from,
         })
+    }
+}
+
+/// bash 工具的超时（秒）：从工具入参 `timeout_ms` 取，缺省 180s，上限 600s。
+/// 入参缺失/非法/超上限都落到缺省或上限，绝不因为模型写错参数而放大资源占用。
+fn bash_timeout_sec(call: &Value) -> u32 {
+    let requested_ms = call.get("timeout_ms").and_then(Value::as_u64);
+    match requested_ms {
+        Some(ms) if ms >= 1_000 => {
+            let sec = (ms / 1_000) as u32;
+            sec.clamp(1, tb::MAX_BASH_TIMEOUT_SEC)
+        }
+        _ => tb::DEFAULT_BASH_TIMEOUT_SEC,
     }
 }
 
@@ -616,8 +641,11 @@ fn run() -> Result<(), String> {
         "injecagent" => run_injec(&args),
         "terminal-bench" => run_tb(&args),
         "swe-v" => run_swev(&args),
+        // POC-1：只重判不重跑——遍历存量 run 目录里的 agent.diff + 任务包，
+        // 在干净容器里重跑判分链，零 LLM 成本。
+        "swev-rejudge" => run_swev_rejudge(&args),
         other => Err(format!(
-            "未知套件 {other}（可选 injecagent / terminal-bench / swe-v）"
+            "未知套件 {other}（可选 injecagent / terminal-bench / swe-v / swev-rejudge）"
         )),
     }
 }
@@ -707,7 +735,9 @@ fn run_swev(args: &Args) -> Result<(), String> {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let mut out = env_for_tool.exec(&command);
+                // POC-2：超时由工具入参给（缺省 180s，上限 600s）——长测试套件能显式要更久。
+                let timeout_sec = bash_timeout_sec(call);
+                let mut out = env_for_tool.exec(&command, timeout_sec);
                 // fix2 反考古护栏（失败轨迹分析 建议5）：git 考古/翻 object 库找上游修复在
                 // 51/145 个 run 出现、单例烧 10-20 轮且从不收敛——命中即在输出前注入护栏。
                 if ARCHAEOLOGY_PATTERNS
@@ -849,8 +879,16 @@ fn run_swev(args: &Args) -> Result<(), String> {
         let agent_wall_ms = task_started.elapsed().as_millis() as u64;
         let task_json = args.data_root.join(format!("{}.json", task.instance_id));
         // D-20 项 2：判分时同步取 eval.log sha256，结果行可回溯到产生 resolved 的确切日志字节。
-        let (resolved, note, eval_sha256) =
-            swev::verify(&args.host, &env_cell, task, &run_dir, &task_json);
+        // POC-1：判分模式开关（clean=全新 eval 容器，默认；in-place=agent 容器内原地判，对照组）。
+        let (resolved, note, eval_sha256) = match args.judge_mode.as_str() {
+            "clean" => swev::verify_clean(&args.host, &env_cell, task, &run_dir, &task_json),
+            "in-place" => swev::verify(&args.host, &env_cell, task, &run_dir, &task_json),
+            other => {
+                return Err(format!(
+                    "未知 --judge-mode {other}（可选 clean / in-place）"
+                ))
+            }
+        };
         env_cell.cleanup();
         if resolved == Some(true) {
             pass += 1;
@@ -874,6 +912,8 @@ fn run_swev(args: &Args) -> Result<(), String> {
             "run_dir": run_dir.display().to_string(),
             // D-20 项 2：eval.log sha256（判分时计算，判分复核可逐字节对账）。
             "eval_sha256": eval_sha256,
+            // POC-1：判分口径标记——clean=全新 eval 容器，in-place=agent 容器内原地判。
+            "judge_mode": args.judge_mode,
             "gate": gate,
             // fix2：attempt 恒 1（审计 D5 关闭 gate 重试），字段保留供历史行兼容。
             "attempts": 1,
@@ -909,6 +949,134 @@ fn run_swev(args: &Args) -> Result<(), String> {
         "af-bench 完成: {} 题, resolved {pass}, infra {infra}, results → {}",
         tasks.len(),
         results_path.display()
+    );
+    Ok(())
+}
+
+/// POC-1：只重判不重跑——遍历存量 run 目录里的 agent.diff，在**干净 eval 容器**里
+/// 重跑判分链（官方 eval_script + 官方判分器），零 LLM 成本。
+///
+/// 用途：判分口径变更（clean vs in-place）需要同题集对照，而重跑 agent 又贵又慢。
+/// 存量 run 目录里的 agent.diff 就是"当时那次 agent 交的东西」，重判即可比。
+///
+/// 用法：
+///   af-bench --suite swev-rejudge --data-root /tmp/swev-s1 \
+///     --from /tmp/bench-fix1-d1-step5 --out /tmp/bench-rejudge-step5 [--tasks a,b]
+/// `--from` 既接受含 `runs/` 的跑批输出目录，也接受直接含 run 目录的目录。
+fn run_swev_rejudge(args: &Args) -> Result<(), String> {
+    if args.from.as_os_str().is_empty() {
+        return Err("swev-rejudge 需要 --from <run 根目录>".into());
+    }
+    let runs_root = if args.from.join("runs").is_dir() {
+        args.from.join("runs")
+    } else {
+        args.from.clone()
+    };
+    let mut results = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(args.out.join("results.jsonl"))
+        .map_err(|err| format!("开 results.jsonl 失败: {err}"))?;
+    // 任务清单：--data-root 下的 *.json 文件名（instance_id）。
+    let mut task_ids: Vec<String> = std::fs::read_dir(&args.data_root)
+        .map_err(|err| format!("读 --data-root 失败: {err}"))?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                return None;
+            }
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    task_ids.sort();
+    let want: Vec<String> = args.tasks.clone();
+    let mut judged = 0usize;
+    let mut pass = 0usize;
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&runs_root)
+        .map_err(|err| format!("读 run 根目录失败: {err}"))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    entries.sort();
+    for run_dir in entries {
+        let name = match run_dir.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // run 目录名：swev-<instance_id>-<profile>-a<N>
+        let rest = match name.strip_prefix("swev-") {
+            Some(r) => r,
+            None => continue,
+        };
+        let task_id = match task_ids.iter().find(|tid| {
+            rest.starts_with(&format!("{tid}-")) && {
+                let tail = &rest[tid.len() + 1..];
+                tail.contains("-a")
+                    && tail.rsplit_once("-a").is_some_and(|(_, n)| {
+                        !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+                    })
+            }
+        }) {
+            Some(tid) => tid.clone(),
+            None => continue,
+        };
+        if !want.is_empty() && !want.contains(&task_id) {
+            continue;
+        }
+        let tail = &rest[task_id.len() + 1..];
+        let profile = tail.rsplit_once("-a").map(|(p, _)| p).unwrap_or("");
+        let diff_path = run_dir.join("agent.diff");
+        if !diff_path.is_file() {
+            eprintln!("跳过 {}：无 agent.diff", name);
+            continue;
+        }
+        let task_json = args.data_root.join(format!("{task_id}.json"));
+        let task: swev::SwevTask = match std::fs::read_to_string(&task_json)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+        {
+            Some(t) => t,
+            None => {
+                eprintln!("跳过 {}：读不到任务包 {}", name, task_json.display());
+                continue;
+            }
+        };
+        // 判分产物写进 run 目录的 rejudge-clean 子目录：不覆盖原判分证据。
+        let out_dir = judge::rejudge_out_dir(&run_dir);
+        let verdict = judge::verify_clean(&task, &diff_path, &out_dir, &task_json);
+        judged += 1;
+        if verdict.resolved == Some(true) {
+            pass += 1;
+        }
+        let row = json!({
+            "suite": "swev-rejudge",
+            "task_id": task_id,
+            "profile": profile,
+            "reward": verdict.resolved,
+            "status": match verdict.resolved {
+                Some(true) => "resolved",
+                Some(false) => "not_resolved",
+                None => "judge_failed",
+            },
+            "judge_mode": "clean",
+            "run_dir": run_dir.display().to_string(),
+            "eval_sha256": verdict.eval_sha256,
+            "verifier_note": verdict.note.chars().take(300).collect::<String>(),
+        });
+        use std::io::Write as _;
+        writeln!(results, "{row}").map_err(|e| format!("写 results 失败: {e}"))?;
+        results.flush().map_err(|e| format!("flush 失败: {e}"))?;
+        eprintln!(
+            "[rejudge] {task_id} ({profile}) resolved={:?} → {}",
+            verdict.resolved,
+            out_dir.display()
+        );
+    }
+    println!(
+        "swev-rejudge 完成: 重判 {judged} 题, resolved {pass}, results → {}",
+        args.out.join("results.jsonl").display()
     );
     Ok(())
 }
@@ -966,7 +1134,8 @@ fn run_tb(args: &Args) -> Result<(), String> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            Ok(Value::String(env_for_tool.exec(&command)))
+            let timeout_sec = bash_timeout_sec(call);
+            Ok(Value::String(env_for_tool.exec(&command, timeout_sec)))
         });
         let spec = AgentSpec {
             endpoint: prof.endpoint.clone(),
