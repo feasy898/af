@@ -943,6 +943,9 @@ fn run_swev(args: &Args) -> Result<(), String> {
                     // 墙钟中位 1112s/992s 远未到 1800s，瓶颈是调用次数而非时间）。
                     // 时间成为约束后与商业线同口径：同样 30 分钟，够就走完全流程。
                     wall_timeout_secs: Some(1_800),
+                    // fix4-align2-tier0（第 0 档 S002+S118）：观测折叠 keep-last-5
+                    // （SWE-agent 官方默认窗口）。只改请求组装，落库 transcript 原样。
+                    observation_window: Some(5),
                     stop: StopCondition {
                         completion_signals: vec!["TASK_COMPLETE".into()],
                         tool_free_turn_limit: 3,
@@ -1347,6 +1350,8 @@ fn run_tb(args: &Args) -> Result<(), String> {
                 max_turns: 40,
                 // fix4：墙钟预算只上 swe-v 线（证据都在那条线）；TB 口径不动。
                 wall_timeout_secs: None,
+                // fix4-align2-tier0：观测折叠只上 swe-v 线；TB 口径不动。
+                observation_window: None,
                 stop: StopCondition {
                     completion_signals: vec!["TASK_COMPLETE".into()],
                     tool_free_turn_limit: 3,
@@ -1521,6 +1526,8 @@ fn run_injec(args: &Args) -> Result<(), String> {
                 max_turns: 16,
                 // fix4：墙钟预算只上 swe-v 线；InjecAgent 口径不动。
                 wall_timeout_secs: None,
+                // fix4-align2-tier0：观测折叠只上 swe-v 线；InjecAgent 口径不动。
+                observation_window: None,
                 stop: StopCondition {
                     completion_signals: Vec::new(),
                     tool_free_turn_limit: 1,

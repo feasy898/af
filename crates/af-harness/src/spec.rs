@@ -148,6 +148,13 @@ pub struct Policy {
     /// None = 不限墙钟（缺省，历史规格原样可读）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_timeout_secs: Option<u64>,
+    /// 观测折叠窗口（fix4-align2-tier0，第 0 档 S002+S118）。Some(n) 时每轮请求
+    /// 只保留最近 n 条工具结果全文，更早的折叠成单行注记（保留调用骨架与 call_id，
+    /// 见 [`crate::run::fold_observations`]）——只影响发给模型的请求组装，
+    /// 不改写落库 transcript（审计面完整）。SWE-agent 官方默认 n=5（A 级消融
+    /// +3.0pp）；None = 不折叠（缺省，历史规格原样可读；TB/InjecAgent 口径不动）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_window: Option<usize>,
     pub stop: StopCondition,
     pub budget_ref: BudgetRef,
 }
