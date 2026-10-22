@@ -9,7 +9,8 @@ use std::process::Command;
 
 // fix4-obs-fix1：观测侧常量与指纹函数同源引用（判分脚本/venv 路径两份常量防漂移）。
 use crate::obs;
-
+// D-37 容器名实例前缀：instance = sha256(out 目录)[:8]（fix4-obs-fix1 随换装窗一并移植）。
+use sha2::{Digest, Sha256};
 use crate::tb;
 
 /// fix4-observability：harness.judge 事件的全字段载体（红队④的实际分派位在此钉死）。
@@ -74,12 +75,51 @@ pub fn load_swev_tasks(root: &Path, names: &[String]) -> Result<Vec<SwevTask>, S
     Ok(out)
 }
 
+/// D-37 产线实例前缀（2026-10-22，14:4x 金丝雀×align2 撞车立项）：
+/// 容器名旧形态 `afbench-swev-<task>-<profile>` 不含产线/out 标识，而 setup 先
+/// `docker rm -f` 再 run——两条线同题并发时后者的 setup 会杀掉前者的 agent
+/// （今日实证；fix2 A/B 时代已有手工硬排除先例，D-22 技术债）。
+/// 新形态 `afbench-<instance>-swev-<task>-<profile>`：instance 取 --out 目录的
+/// 短哈希（稳定、无需新参数、不同 out 天然不同名），跨线同题并发互不 rm。
+/// 引用面调查结论（全工作区+tools/）：无任何精确名消费者——tools/ 零处引用
+/// `afbench`（factory-watch/keepalive/sched 只数 `docker images`；img-gc 按
+/// 镜像 ancestor 过滤；escrow/cb 线用各自命名），文档引用均为通配/占位/历史
+/// 记录，故默认带前缀、不设兼容开关（测量语义零改动：只动容器命名）。
+///
+/// 哈希口径：--out 路径字符串的 sha256 前 8 位十六进制。用原字符串而非
+/// canonicalize——无 I/O、无失败分支；同一臂的 --out 由调度器固定（factory-sched
+/// 恒传绝对路径），跨重启稳定；相对/绝对两种写法哈希不同也只会多出一个实例名，
+/// 不会退化成同名互踩（失败模式单向安全）。
+pub fn instance_id(out: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(out.to_string_lossy().as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// 容器名生成（与 [`instance_id`] 合起来即 D-37 命名制）。task_id 的 `__`
+/// 按旧口径替换为 `-`（swebench instance_id 惯例），其余段均取 [a-z0-9-]，
+/// 合成名落在 docker 合法名字符集 `[a-zA-Z0-9][a-zA-Z0-9_.-]*` 内。
+pub fn container_name(instance: &str, task_id: &str, profile: &str) -> String {
+    format!(
+        "afbench-{instance}-swev-{}-{profile}",
+        task_id.replace("__", "-")
+    )
+}
+
 /// 起容器。sweb.eval 镜像自带 /testbed 与全部测试资产，无需 build。
-pub fn setup(host: &str, task: &SwevTask, profile: &str) -> Result<tb::TbEnv, String> {
-    let container = format!(
-        "afbench-swev-{}-{profile}",
-        task.instance_id.replace("__", "-")
-    );
+/// `instance` 为产线实例前缀（见 [`instance_id`]），由调用方按 --out 计算一次。
+pub fn setup(
+    host: &str,
+    task: &SwevTask,
+    profile: &str,
+    instance: &str,
+) -> Result<tb::TbEnv, String> {
+    let container = container_name(instance, &task.instance_id, profile);
     let _ = tb_ssh(host, &format!("docker rm -f {container}"), 30);
     // 出网代理按宿主区分：anolis 容器经宿主 squid（172.17.0.1:8123）；
     // 本机（local）容器走 docker NAT 直连（本机无 8123 监听），语义同为"容器可出网"。
@@ -338,4 +378,61 @@ fn tb_ssh(host: &str, script: &str, timeout_sec: u32) -> Result<(bool, String), 
         text.push_str(&stderr);
     }
     Ok((output.status.success(), text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_id_stable_per_out_dir() {
+        // 同一 --out 稳定（跨重启/跨任务同哈希）；不同 --out 必然不同（防撞的根）。
+        let a1 = instance_id(Path::new("/tmp/bench-fix4-canary"));
+        let a2 = instance_id(Path::new("/tmp/bench-fix4-canary"));
+        let b = instance_id(Path::new("/tmp/bench-fix4-align2"));
+        assert_eq!(a1, a2, "同一 out 目录必须给出稳定 instance");
+        assert_ne!(a1, b, "不同 out 目录必须给出不同 instance");
+        // 8 位小写十六进制（sha256 前 4 字节）。
+        assert_eq!(a1.len(), 8);
+        assert!(a1
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch)));
+    }
+
+    #[test]
+    fn container_name_shape_and_docker_charset() {
+        let name = container_name("1a2b3c4d", "pydata__xarray-4094", "mavis-m31f");
+        assert_eq!(name, "afbench-1a2b3c4d-swev-pydata-xarray-4094-mavis-m31f");
+        // docker 合法名字符集 [a-zA-Z0-9][a-zA-Z0-9_.-]*（首字符 'a' 满足）。
+        assert!(name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')));
+    }
+
+    #[test]
+    fn cross_line_same_task_never_shares_name() {
+        // D-37 根治点：同题同 profile、不同产线（instance 不同）→ 容器名不同，
+        // 后者的 `docker rm -f` 物理上不可能命中前者的容器。
+        let task = "pydata__xarray-4094";
+        let left = container_name(
+            &instance_id(Path::new("/tmp/bench-canary")),
+            task,
+            "mavis-m31f",
+        );
+        let right = container_name(
+            &instance_id(Path::new("/tmp/bench-align2")),
+            task,
+            "mavis-m31f",
+        );
+        assert_ne!(left, right);
+        assert!(left.starts_with("afbench-") && left.contains("-swev-"));
+        assert!(right.starts_with("afbench-") && right.contains("-swev-"));
+    }
+
+    #[test]
+    fn task_id_double_underscore_sanitized_like_before() {
+        // 与旧口径一致：instance_id 的 `__` 替换为 `-`，不改判分/取证任何语义。
+        let name = container_name("deadbeef", "astropy__astropy-12907", "glm-cp");
+        assert_eq!(name, "afbench-deadbeef-swev-astropy-astropy-12907-glm-cp");
+    }
 }

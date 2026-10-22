@@ -722,8 +722,12 @@ fn run_swev(args: &Args) -> Result<(), String> {
         .map_err(|err| format!("开 results.jsonl 失败: {err}"))?;
     let mut pass = 0usize;
     let mut infra = 0usize;
+    // D-37：产线实例前缀按 --out 计算一次（同进程所有任务共用）——容器名
+    // `afbench-<instance>-swev-<task>-<profile>`，跨线同题并发不再互踩
+    // （命名制与引用面调查结论见 swev::instance_id 文档注释）。
+    let instance = swev::instance_id(&args.out);
     'task: for (index, task) in tasks.iter().enumerate() {
-        let env = match swev::setup(&args.host, task, &args.profile) {
+        let env = match swev::setup(&args.host, task, &args.profile, &instance) {
             Ok(env) => env,
             Err(err) => {
                 infra += 1;
