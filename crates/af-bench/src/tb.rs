@@ -321,10 +321,12 @@ fn tail(text: &str, cap: usize) -> String {
 /// 非交互要求、超时行为、exit 行在末尾（首行留给命令输出，配合提交式完成判定）。
 /// POC-2：入参加 `timeout_ms`（缺省 180s、上限 600s）——长测试套件可以显式要更久，
 /// 不用再靠"命令内 timeout <secs>"去撞 harness 自己的硬上限。
+/// fix4-align-r2：描述补离线声明（GLM 机制：工具描述随每次请求重发，是抗遗忘的
+/// 最强通道；被墙代理会谎报 exit=0+空响应体，须把这一反馈形态如实写明）。
 pub fn bash_tool_decl(workdir: &str) -> Value {
     json!({
         "name": "bash",
-        "description": format!("Execute a bash command in the task environment (a Linux container). Every command runs in a fresh non-interactive shell with the working directory set to {workdir}; shell state (cd, exported variables) does not persist between commands. Interactive commands (editors, prompts) and commands that never exit are killed by a timeout — use non-interactive flags. The tool returns the command's output followed by a final `exit=<code>` line. Use it to inspect, modify, build and test. Each call is killed after {DEFAULT_BASH_TIMEOUT_SEC}s by default; pass timeout_ms (max {MAX_BASH_TIMEOUT_SEC}000) for long-running commands such as a full test suite — the harness cap is hard, so `timeout <secs>` inside the command cannot extend it; for very long jobs, redirect output to a file and read it back in parts."),
+        "description": format!("Execute a bash command in the task environment (a Linux container). Every command runs in a fresh non-interactive shell with the working directory set to {workdir}; shell state (cd, exported variables) does not persist between commands. Interactive commands (editors, prompts) and commands that never exit are killed by a timeout — use non-interactive flags. The tool returns the command's output followed by a final `exit=<code>` line; a non-zero exit is reported to you as an error. Use it to inspect, modify, build and test. Each call is killed after {DEFAULT_BASH_TIMEOUT_SEC}s by default; pass timeout_ms (max {MAX_BASH_TIMEOUT_SEC}000) for long-running commands such as a full test suite — the harness cap is hard, so `timeout <secs>` inside the command cannot extend it; for very long jobs, redirect output to a file and read it back in parts. This container has NO usable internet access: pip/curl/wget/apt and git remote operations fail, hang, or return empty responses — sometimes with a misleading exit=0 and an empty body. Never retry a failed or empty network command; work with what is already in the container."),
         "parameters": {
             "type": "object",
             "properties": {

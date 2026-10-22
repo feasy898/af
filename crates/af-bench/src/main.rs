@@ -19,7 +19,7 @@ use af_credential::{issue_root, RootSpec};
 use af_harness::{
     AgentSpec, AuthStyle, BudgetBinding, BudgetRef, BudgetUnit, ContextTemplate, EndpointKey,
     EndpointSpec, Launch, Opened, Policy, Protocol, ReasoningTier, RunReport, RunStatus,
-    StopCondition, ToolDecl, ToolRegistry, TranscriptItem,
+    StopCondition, ToolDecl, ToolFailure, ToolRegistry, TranscriptItem,
 };
 use af_meter::BudgetLedger;
 use af_stop::StopPolicy;
@@ -71,6 +71,73 @@ mod tests {
         std::fs::write(root.join("swev-astropy__astropy-12907-glm-cp-aX"), "").unwrap();
         assert_eq!(next_attempt_index(&root, task, profile), 3);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- fix4-align-r2：bash 结果通道判别 ----
+
+    #[test]
+    fn bash_nonzero_exit_becomes_tool_failure_with_command_fingerprint() {
+        let raw = "some output\nE: Unable to locate package\nexit=100";
+        let err = bash_result("apt-get install foo", raw.into()).unwrap_err();
+        assert_eq!(
+            err.error_code,
+            format!("exit:100:{}", fnv1a64_hex("apt-get install foo"))
+        );
+        assert!(err.message.starts_with("some output"), "{}", err.message);
+        assert!(err.message.ends_with("exit=100"), "{}", err.message);
+        // 观察原文原样保留（is_error=true 但模型看到的还是命令自己的输出）。
+        assert_eq!(err.output, Some(Value::String(err.message.clone())));
+        // 不同命令 → 不同指纹（止损规则①只对逐字重复连击收束）。
+        let other = bash_result("apt-get install bar", raw.into()).unwrap_err();
+        assert_ne!(err.error_code, other.error_code);
+    }
+
+    #[test]
+    fn bash_empty_network_probe_gets_offline_guard() {
+        // 被墙代理的实测形态：exit=0 + 近空响应体（'exit: 0'）。
+        let out =
+            bash_result("timeout 15 curl -sSI https://github.com", "\nexit=0".into()).unwrap();
+        let text = out.as_str().unwrap();
+        assert!(
+            text.starts_with("[harness] Network access is unavailable"),
+            "{text}"
+        );
+        assert!(text.ends_with("exit=0"), "{text}");
+    }
+
+    #[test]
+    fn bash_network_command_with_real_output_passes_through() {
+        // 本地缓存命中的 pip install 输出很长——不是空响应谎报，不护栏。
+        let raw =
+            "Requirement already satisfied: astropy in /usr/lib/python3/dist-packages\nexit=0";
+        let out = bash_result("pip install astropy", raw.into()).unwrap();
+        assert_eq!(out, Value::String(raw.into()));
+    }
+
+    #[test]
+    fn bash_silent_success_gets_no_output_note() {
+        let out = bash_result("touch /tmp/marker", "\nexit=0".into()).unwrap();
+        let text = out.as_str().unwrap();
+        assert!(text.contains("produced no output"), "{text}");
+        assert!(text.ends_with("exit=0"), "{text}");
+    }
+
+    #[test]
+    fn bash_normal_output_passes_through_unchanged() {
+        let raw = "TASK_COMPLETE\nexit=0";
+        let out = bash_result("echo TASK_COMPLETE", raw.into()).unwrap();
+        assert_eq!(out, Value::String(raw.into()));
+    }
+
+    #[test]
+    fn split_exit_line_takes_the_last_marker_and_keeps_body() {
+        // 命令输出里自带 exit= 字样也不干扰：rfind 取的是执行器追加的末行。
+        let (body, rc) = split_exit_line("he said exit=1 then left\nexit=0");
+        assert_eq!(rc, Some(0));
+        assert_eq!(body, "he said exit=1 then left");
+        let (body, rc) = split_exit_line("no marker here");
+        assert_eq!(rc, None);
+        assert_eq!(body, "no marker here");
     }
 }
 
@@ -176,6 +243,93 @@ fn bash_timeout_sec(call: &Value) -> u32 {
         }
         _ => tb::DEFAULT_BASH_TIMEOUT_SEC,
     }
+}
+
+// ---- fix4-align-r2：命令失败负反馈通道 + 离线环境诚实反馈 ----
+// 机制证据（GLM+MiniMax 互补印证，fix1 代际实测）：容器出网被墙而 prompt/工具描述
+// 零声明 → 模型反复 pip download/curl/翻 pip cache（13236 两 attempt、4970、13398、
+// 15629）；执行器把真实 rc 降级成输出末行装饰文本、不进 is_error 通道、不对空输出
+// 判别 → 被墙代理谎报 exit=0+空响应体（配对集 30 次网络探测 20 次近空、13 次 exit=0），
+// 空转回合既无负反馈修正也无刹车介入。
+
+/// 网络探测模式：命中且输出近空 → 前置离线护栏。取证据里最明确的探测形态，
+/// 避免误伤本地操作（`git remote -v` 这类本地读不在列）。
+const NETWORK_PROBE_PATTERNS: &[&str] = &[
+    "pip install",
+    "pip3 install",
+    "pip download",
+    "pip3 download",
+    "pip sync",
+    "curl",
+    "wget",
+    "git clone",
+    "git fetch",
+    "git pull",
+    "git push",
+    "apt-get",
+    "apt install",
+    "ping ",
+    "conda install",
+    "npm install",
+];
+
+/// 输出近空阈值（字符数）：被墙代理的空响应体实测只有数个字符（'exit: 0'）。
+const NEAR_EMPTY_OUTPUT_CHARS: usize = 16;
+
+fn fnv1a64_hex(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// 从 exec 输出末尾拆出 `exit=<rc>` 行，返回 (正文, rc)。行缺失 → rc=None。
+fn split_exit_line(text: &str) -> (String, Option<i32>) {
+    let Some(pos) = text.rfind("\nexit=") else {
+        return (text.to_string(), None);
+    };
+    let rest = &text[pos + 1..];
+    let rc_end = rest.find('\n').unwrap_or(rest.len());
+    let rc = rest[..rc_end]
+        .strip_prefix("exit=")
+        .and_then(|v| v.trim().parse::<i32>().ok());
+    (format!("{}{}", &text[..pos], &rest[rc_end..]), rc)
+}
+
+/// bash 结果通道判别（fix4-align-r2，MiniMax 机制）：
+/// · rc≠0 → ToolFailure：is_error=true 进 API 负反馈通道（anthropic tool_result
+///   is_error，endpoint.rs 原样上线），观察原文经 ToolFailure.output 原样保留；
+///   error_code 带命令指纹（FNV-1a64）——止损规则①只对「逐字重复的失败连击」收束，
+///   不同命令的正常失败（改代码→重跑测试）互不打断；
+/// · rc=0 且命中网络探测模式且输出近空 → 前置离线护栏（谎报成功的唯一可靠信号
+///   就是空响应体）；
+/// · rc=0 且完全无输出 → 附无输出注记（静默成功常是文件操作，也可能是空响应谎报）。
+fn bash_result(command: &str, raw: String) -> Result<Value, ToolFailure> {
+    let (body, rc) = split_exit_line(&raw);
+    let rc = rc.unwrap_or(124);
+    let text = format!("{body}\nexit={rc}");
+    if rc != 0 {
+        return Err(ToolFailure {
+            error_code: format!("exit:{rc}:{}", fnv1a64_hex(command)),
+            message: text.clone(),
+            output: Some(Value::String(text)),
+        });
+    }
+    if NETWORK_PROBE_PATTERNS.iter().any(|p| command.contains(p))
+        && body.trim().chars().count() < NEAR_EMPTY_OUTPUT_CHARS
+    {
+        return Ok(Value::String(format!(
+            "[harness] Network access is unavailable in this environment: egress is blocked, and a captive proxy can answer with exit=0 and an empty body. Treat this as a FAILED network operation — do not retry it. Implement the fix with what is already in the container.\n{text}"
+        )));
+    }
+    if body.trim().is_empty() {
+        return Ok(Value::String(format!(
+            "[harness] Note: the command exited 0 but produced no output.\n{text}"
+        )));
+    }
+    Ok(Value::String(text))
 }
 
 // ---------- 端点档案（优惠通道，见 状态/优惠通道.md） ----------
@@ -565,7 +719,9 @@ fn bench_order(run_id: &str) -> Result<WorkOrder, String> {
 /// system 只留一行角色（mini-swe-agent 实证一行 system 足以拿 74%+，字数不是变量，
 /// 纪律随任务重申才是）；全部纪律/工作流/提交协议放 instance 模板随每题重发——
 /// 一次性 system 在长对话里抗遗忘差，是 S0 D2（越权改测试）/D6（交付物缺失）的直接机制。
-const SWEV_SYSTEM_PROMPT: &str = "You are an autonomous software engineer that fixes issues in a real repository by issuing bash commands inside a Linux container. The repository checkout is at /testbed.";
+/// fix4-align-r2：system 补离线声明（GLM 机制：环境约束零声明是网络空转的一半成因；
+/// system 每轮随请求重发，与 instance 模板/工具描述三通道冗余）。
+const SWEV_SYSTEM_PROMPT: &str = "You are an autonomous software engineer that fixes issues in a real repository by issuing bash commands inside a Linux container. The repository checkout is at /testbed. The container has no usable internet access: network commands fail or return empty responses, so never attempt or retry downloads.";
 
 /// fix2 instance 模板：随任务 user 消息每题重发。来源：mini-swe-agent instance_template
 /// （工作流四步 + 提交三步 + 边界）+ mcode Core Judgment 两句（不悄悄扩缩任务/歧义先做
@@ -581,7 +737,7 @@ const SWEV_INSTANCE_PROTOCOL: &str = r#"# How to work
 - NEVER modify test files or test configuration (any path containing "test", plus conftest.py, tox.ini, pytest.ini, setup.cfg). The grading harness owns the tests; a patch touching them is rejected.
 - Do NOT edit changelogs or release notes (CHANGES.rst, docs/changes*, docs/releases*) — grading ignores documentation; editing it only burns your turn budget.
 - The whole run has a HARD WALL-CLOCK BUDGET of 30 minutes. When the harness tells you little time remains, submit immediately with your best current fix — the run is killed at the deadline with whatever is on disk.
-- The container has NO usable internet access: pip install/download, curl, wget and git remotes fail. Never retry a failed download — implement the fix with what is already in the container.
+- The container has NO usable internet access: pip install/download, curl, wget and git remote operations fail — and a blocked proxy can even answer with exit=0 and an empty body, so an empty response from a network command means failure. Never retry a failed or empty network command — implement the fix with what is already in the container.
 - A run that ends with no code changes is an automatic failure.
 - Every bash command runs in a fresh non-interactive shell starting in /testbed; shell state (cd, exported variables) does NOT persist between commands. Never open editors or interactive prompts; use non-interactive flags (e.g. -y, DEBIAN_FRONTEND=noninteractive). Commands may be killed by a timeout.
 
@@ -753,17 +909,20 @@ fn run_swev(args: &Args) -> Result<(), String> {
                 }
                 let mut hist = recent_for_tool.lock().unwrap_or_else(|e| e.into_inner());
                 let repeats = hist.iter().filter(|c| c.as_str() == command).count();
-                hist.push(command);
+                hist.push(command.clone());
                 if hist.len() > 6 {
                     hist.remove(0);
                 }
                 if repeats >= 2 {
-                    return Ok(Value::String(format!(
+                    out = format!(
                         "[harness] You have issued this exact command {} times. Repeating it will not make progress — try a different approach, or finish with your best current fix.\n{}",
                         repeats + 1, out
-                    )));
+                    );
                 }
-                Ok(Value::String(out))
+                // fix4-align-r2：rc 判别收尾——非零退出进 is_error 负反馈通道
+                // （error_code 带命令指纹，止损规则①对逐字重复连击收束）；
+                // 空响应网络探测前置离线护栏；静默成功附无输出注记。
+                bash_result(&command, out)
             });
             let spec = AgentSpec {
                 endpoint: endpoint.clone(),
@@ -831,7 +990,14 @@ fn run_swev(args: &Args) -> Result<(), String> {
                 },
                 order: &order,
                 tools: registry,
-                stop_policy: StopPolicy::default(),
+                // fix4-align-r2：bash 非零退出改走 is_error 负反馈通道后，止损规则③
+                // （累计错误阈值）不再适用于 bash——测试失败是常态工作信号，累计不得
+                // 升级（阈值抬到实际不可达）；规则①指纹连击保留（error_code 带命令
+                // 指纹，只对逐字重复的失败连击收束）。
+                stop_policy: StopPolicy {
+                    normal_error_threshold: 1_000,
+                    ..StopPolicy::default()
+                },
                 breakpoint: af_harness::Breakpoint::None,
             }) {
                 Ok(r) => {
@@ -864,8 +1030,10 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         "trial": args.trial,
                         "reward": Value::Null,
                         "status": "run_failed",
-                        // fix4（结果代号 bump：预算语义变更）：scaffold v4 = v3 + 墙钟 1800s。
-                        "scaffold": "v4",
+                        // fix4-align2（合流 bump）：scaffold v6 = v4 ∪ v5 机制并集
+                        // （墙钟 1800s + 指纹刹车 + bash is_error 负反馈 + 离线三通道
+                        // + 空响应护栏），机制清单见下方结果行注释。
+                        "scaffold": "v6",
                         // D-20 项 1：run_failed 行也记实际目录（trail 留在现场供复核）。
                         "run_dir": attempt_dir.display().to_string(),
                         "eval_sha256": Value::Null,
@@ -912,12 +1080,19 @@ fn run_swev(args: &Args) -> Result<(), String> {
             "trial": args.trial,
             "reward": resolved,
             "status": status_label(&report.status),
-            // fix4（结果代号 bump：预算语义变更，机制=墙钟预算 1800s 对齐商业线 +
-            // 逐字重复成功调用指纹刹车）：scaffold v4 = v3 + wall_timeout 1800s。
+            // fix4-align2（合流结果代号 bump，§7.3⑩ 机制并集）：scaffold v6
+            // = v3 + 以下并集——
+            // · 来自 v4（fix4-align-r1）：墙钟预算 wall_timeout_secs=1800s 对齐商业线
+            //   os_timeout + 剩 300s/120s 收尾提醒 + Event::ToolOk 入参指纹
+            //   （逐字重复成功调用连击 3 次 → Stop(NoInfluence)）。
+            // · 来自 v5（fix4-align-r2）：bash 非零退出进 is_error 负反馈通道
+            //   （error_code 带命令指纹，规则①只对逐字重复失败连击收束）+
+            //   离线环境 system/工具描述/instance 三通道声明 + 空响应网络探测护栏
+            //   + 规则③累计错误阈值抬至 1000（bash 常态失败不升级）。
             // v3 原文：提交式完成协议 + instance 纪律 + 250 步/$3/温度0/top_p1/
             // max_tokens 32000 + 无 gate 重试。reasoning 档位按审计 §6.A.7 显式声明
             // （保持 Off = mini 默认不发 thinking）。
-            "scaffold": "v4",
+            "scaffold": "v6",
             "reasoning_tier": "off",
             // D-20 项 1：实际 run 目录（重跑按序号递增，不再同名覆写）。
             "run_dir": run_dir.display().to_string(),
@@ -1146,7 +1321,8 @@ fn run_tb(args: &Args) -> Result<(), String> {
                 .unwrap_or("")
                 .to_string();
             let timeout_sec = bash_timeout_sec(call);
-            Ok(Value::String(env_for_tool.exec(&command, timeout_sec)))
+            // fix4-align-r2：与 swe-v 同一 rc 判别（失败进 is_error 通道、空响应护栏）。
+            bash_result(&command, env_for_tool.exec(&command, timeout_sec))
         });
         let spec = AgentSpec {
             endpoint: prof.endpoint.clone(),
@@ -1209,7 +1385,11 @@ fn run_tb(args: &Args) -> Result<(), String> {
             },
             order: &order,
             tools: registry,
-            stop_policy: StopPolicy::default(),
+            // fix4-align-r2：与 swe-v 同口径——规则③对 bash 常态失败不升级。
+            stop_policy: StopPolicy {
+                normal_error_threshold: 1_000,
+                ..StopPolicy::default()
+            },
             breakpoint: af_harness::Breakpoint::None,
         }) {
             Ok(report) => report,
