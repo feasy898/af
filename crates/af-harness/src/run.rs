@@ -374,6 +374,7 @@ fn call_fingerprint(args: &Value) -> Option<String> {
 /// 依据：SWE-agent 官方 last-5-observations 窗口（A 级消融，比全量历史 +3.0pp、
 /// Claude 3 Opus 上相对 +50%；丢弃的是过期文件内容，保留计划与动作轨迹）
 /// + Anthropic context editing（超限清旧工具结果，保留调用骨架）。
+///
 /// 两者合并为同一个零 LLM 成本的结构性机制（S009 教训：不上 LLM 摘要压缩器，
 /// 只用一个确定性折叠器；S033 语义下 System/User 项永不折叠，约束钉在窗口外）。
 /// 只统计 Tool 项：折叠边界每轮至多前进一条，已折叠前缀逐字稳定，前缀缓存友好。
