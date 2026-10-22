@@ -167,6 +167,10 @@ pub struct TokenTotals {
     pub cache_read: u64,
 }
 
+/// 进度行五元组（轮次 / 模型调用数 / effect fresh / effect replay / token 三本账）。
+/// CI clippy type_complexity：从 `run_progress` 签名里提出的具名类型。
+pub type ProgressRow = (u32, u64, u64, u64, TokenTotals);
+
 /// 打开后的执行器。一个目录一把库、一个网关、一份 trace。
 pub struct Opened {
     status: OpenStatus,
@@ -493,7 +497,8 @@ impl Opened {
             "backoff_ms": meta.backoff_ms,
             "key_refreshed": key_refreshed,
         });
-        self.trace.write_normal("harness.model", model_payload.clone());
+        self.trace
+            .write_normal("harness.model", model_payload.clone());
         obs_emit(launch, "harness.model", false, &model_payload);
         // fix4-obs-fix1 裁决：不引入 fix2 的 finish_reason=length 截断反馈
         // （LENGTH_FEEDBACK 属 fix2 测量语义变更，fix1 口径无此反馈通道）。
@@ -545,7 +550,10 @@ impl Opened {
                 "attempt": attempt,
                 "ok": ok,
             });
-            if let Err(err) = self.trace.write_critical("harness.key_refresh", payload.clone()) {
+            if let Err(err) = self
+                .trace
+                .write_critical("harness.key_refresh", payload.clone())
+            {
                 // critical 落盘失败不能吞掉原有 401 处理路径：记录后继续，
                 // 该失败会在 trace shutdown 时以 PersistFailed 显形。
                 eprintln!("[harness] key_refresh critical 落盘失败: {err}");
@@ -597,7 +605,9 @@ impl Opened {
             "retry_after_ms": meta.retry_after_ms,
             "backoff_ms": meta.backoff_ms,
         });
-        if let Err(trace_err) = self.trace.write_critical("harness.retry_exhausted", payload.clone())
+        if let Err(trace_err) = self
+            .trace
+            .write_critical("harness.retry_exhausted", payload.clone())
         {
             eprintln!("[harness] retry_exhausted critical 落盘失败: {trace_err}");
         }
@@ -698,7 +708,8 @@ impl Opened {
             "wall_ms": done.wall_ms,
             "error_head": done.error_head,
         });
-        self.trace.write_normal("harness.tool", tool_payload.clone());
+        self.trace
+            .write_normal("harness.tool", tool_payload.clone());
         obs_emit(launch, "harness.tool", false, &tool_payload);
         live.transcript.push(TranscriptItem::Tool {
             call_id: done.call_id,
@@ -816,12 +827,7 @@ impl Opened {
         }
     }
 
-    fn finish(
-        &self,
-        launch: &Launch<'_>,
-        live: &mut Live,
-        status: RunStatus,
-    ) -> Result<RunReport> {
+    fn finish(&self, launch: &Launch<'_>, live: &mut Live, status: RunStatus) -> Result<RunReport> {
         self.trace_terminal(launch, &live.row, &status)?;
         live.row.terminal_json = Some(serde_json::to_string(&status)?);
         self.persist(live)?;
@@ -839,7 +845,12 @@ impl Opened {
         Ok(())
     }
 
-    fn trace_terminal(&self, launch: &Launch<'_>, row: &RunRecord, status: &RunStatus) -> Result<()> {
+    fn trace_terminal(
+        &self,
+        launch: &Launch<'_>,
+        row: &RunRecord,
+        status: &RunStatus,
+    ) -> Result<()> {
         let kind = match status {
             RunStatus::BudgetExhausted { .. } => "harness.budget",
             RunStatus::Unauthorized { .. } => "harness.unauthorized",
@@ -874,16 +885,13 @@ impl Opened {
     /// run 以 Err 收场（run_failed）时报告不存在，af-bench 据此回填 run.finished——
     /// token 从已落库的对话快照（Assistant.usage）实算：run_failed 前的成功调用
     /// 照样真实消耗 token（计费事实），不得落 0（smoke2 实证 68 次调用 Σinput=50199）。
-    pub fn run_progress(&self, run_id: &str) -> Result<Option<(u32, u64, u64, u64, TokenTotals)>> {
+    pub fn run_progress(&self, run_id: &str) -> Result<Option<ProgressRow>> {
         Ok(self.store.load(run_id)?.map(|row| {
             let tokens = parse_stored::<Vec<TranscriptItem>>(&row.transcript_json, "对话快照")
                 .map(|transcript| {
                     let mut tokens = TokenTotals::default();
                     for item in &transcript {
-                        if let TranscriptItem::Assistant {
-                            usage: Some(u), ..
-                        } = item
-                        {
+                        if let TranscriptItem::Assistant { usage: Some(u), .. } = item {
                             tokens.input = tokens.input.saturating_add(u.input_tokens);
                             tokens.output = tokens.output.saturating_add(u.output_tokens);
                             tokens.cache_read =

@@ -4,14 +4,17 @@
 //!   runs/<line>/<arm>/<run_id>/events.jsonl      每 run 事件流（信封+payload，seq 单调）
 //!   index/runs-<YYYYMM>.jsonl                     每 run 终态索引行
 //!   index/batch-<batch_id>.manifest.json          批次清单（Merkle 根，第三方可重算）
+//!   <观测根>/../observability-archive/corrections/<run_id>-<ts>[-kN]/
+//!                                                证据更正归档（硬规则 4①，原字节+sha256）
 //!
 //! 纪律：
 //! - D-24：观测数据绝不落 tmpfs——根目录解析后落在 /tmp、/dev/shm、/run 或 fstype=tmpfs 即拒绝启动；
 //! - D-14/D-22：路径段白名单 `^[A-Za-z0-9._-]{1,64}$` 且禁 `.`/`..`，不合格立即报错，不静默改写；
 //! - 密钥零明文：本模块只落指纹与布尔，绝不落密钥值。
 
-use sha2::{Digest, Sha256};
+use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -76,18 +79,25 @@ pub fn resolve_root() -> Result<PathBuf, String> {
         .map_err(|err| format!("realpath {raw} 失败: {err}"))?
         .to_string_lossy()
         .to_string();
+    reject_memory_disk(&real)?;
+    Ok(path)
+}
+
+/// D-24 内存盘红线（realpath 判定）：观测根与更正归档根共用。
+/// real==/tmp、/dev/shm、/run 及其子路径，或 fstype=tmpfs/devtmpfs，一律拒绝。
+pub fn reject_memory_disk(real: &str) -> Result<(), String> {
     let on_memory_disk = real == "/tmp"
         || real.starts_with("/tmp/")
         || real == "/dev/shm"
         || real.starts_with("/dev/shm/")
         || real == "/run"
         || real.starts_with("/run/");
-    if on_memory_disk || fstype_is_tmpfs(&real)? {
+    if on_memory_disk || fstype_is_tmpfs(real)? {
         return Err(format!(
-            "观测根 {real} 落在内存盘（D-24 红线），拒绝启动；用 AF_OBS_ROOT 指向持久盘"
+            "观测数据根 {real} 落在内存盘（D-24 红线），拒绝；用持久盘路径"
         ));
     }
-    Ok(path)
+    Ok(())
 }
 
 fn fstype_is_tmpfs(real: &str) -> Result<bool, String> {
@@ -221,7 +231,10 @@ fn mem_usage_kb(host: &str, container: &str) -> Result<u64, String> {
 }
 
 fn parse_size_to_kb(text: &str) -> Option<u64> {
-    let (num, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(text.len()));
+    let (num, unit) = text.split_at(
+        text.find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(text.len()),
+    );
     let value: f64 = num.trim().parse().ok()?;
     let mult = match unit.trim() {
         "B" => 1.0 / 1024.0,
@@ -281,7 +294,8 @@ pub fn swebench_version() -> Result<String, String> {
 
 /// afbench 可执行字节指纹（S6 指纹集"判分二进制 sha256"成员）。
 pub fn bench_binary_sha256() -> Result<String, String> {
-    let data = std::fs::read("/proc/self/exe").map_err(|err| format!("读 /proc/self/exe: {err}"))?;
+    let data =
+        std::fs::read("/proc/self/exe").map_err(|err| format!("读 /proc/self/exe: {err}"))?;
     Ok(sha256_bytes(&data))
 }
 
@@ -307,7 +321,10 @@ pub fn harness_git_rev() -> String {
         }
     }
     let manifest = env!("CARGO_MANIFEST_DIR");
-    if let Ok(out) = Command::new("git").args(["-C", manifest, "rev-parse", "HEAD"]).output() {
+    if let Ok(out) = Command::new("git")
+        .args(["-C", manifest, "rev-parse", "HEAD"])
+        .output()
+    {
         if out.status.success() {
             return String::from_utf8_lossy(&out.stdout).trim().to_string();
         }
@@ -331,7 +348,8 @@ impl RunSink {
         let arm = sanitize_segment(arm, "arm")?;
         let base = sanitize_segment(run_id, "run_id")?;
         let runs_root = root.join("runs").join(&line).join(&arm);
-        std::fs::create_dir_all(&runs_root).map_err(|err| format!("建 {} 失败: {err}", runs_root.display()))?;
+        std::fs::create_dir_all(&runs_root)
+            .map_err(|err| format!("建 {} 失败: {err}", runs_root.display()))?;
         let mut chosen = base.clone();
         let mut dir = runs_root.join(&chosen);
         let mut n = 1u32;
@@ -391,10 +409,7 @@ impl RunSink {
     }
 
     pub fn error_count(&self) -> usize {
-        self.errors
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
+        self.errors.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// 已分配 seq 数（= 事件条数口径；写失败的事件也占 seq，索引行与文件实况的
@@ -457,7 +472,7 @@ pub fn merkle_root_sorted_hex(hashes: &[String]) -> String {
         return sha256_bytes(b"");
     }
     while leaves.len() > 1 {
-        let mut next = Vec::with_capacity((leaves.len() + 1) / 2);
+        let mut next = Vec::with_capacity(leaves.len().div_ceil(2));
         let mut i = 0;
         while i < leaves.len() {
             if i + 1 == leaves.len() {
@@ -496,8 +511,7 @@ pub fn write_batch_manifest(
     let index_dir = root.join("index");
     std::fs::create_dir_all(&index_dir).map_err(|err| format!("建 index 失败: {err}"))?;
     // 从全部月度索引文件里收集本批 run 的 events_sha256（读侧口径与 checker 一致）。
-    let want: std::collections::BTreeSet<&str> =
-        run_ids.iter().map(String::as_str).collect();
+    let want: std::collections::BTreeSet<&str> = run_ids.iter().map(String::as_str).collect();
     let mut found: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let entries = std::fs::read_dir(&index_dir).map_err(|err| format!("读 index 失败: {err}"))?;
     let mut files: Vec<PathBuf> = entries
@@ -512,7 +526,8 @@ pub fn write_batch_manifest(
         .collect();
     files.sort();
     for file in files {
-        let text = std::fs::read_to_string(&file).map_err(|err| format!("读 {} 失败: {err}", file.display()))?;
+        let text = std::fs::read_to_string(&file)
+            .map_err(|err| format!("读 {} 失败: {err}", file.display()))?;
         for row in text.lines().filter(|l| !l.trim().is_empty()) {
             if let Ok(v) = serde_json::from_str::<Value>(row) {
                 if let (Some(rid), Some(sha)) = (
@@ -545,8 +560,11 @@ pub fn write_batch_manifest(
         "merkle_algo": MERKLE_ALGO,
     });
     let path = index_dir.join(format!("batch-{batch_id}.manifest.json"));
-    std::fs::write(&path, serde_json::to_string_pretty(&manifest).unwrap_or_default())
-        .map_err(|err| format!("写 {} 失败: {err}", path.display()))?;
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    )
+    .map_err(|err| format!("写 {} 失败: {err}", path.display()))?;
     Ok(path)
 }
 
@@ -653,13 +671,7 @@ impl ResourceSampler {
                     if since_sample >= INTERVAL {
                         since_sample = std::time::Duration::ZERO;
                         sample_once(
-                            &sink2,
-                            &run_id2,
-                            &host,
-                            &container,
-                            &disk_path,
-                            &peak2,
-                            "periodic",
+                            &sink2, &run_id2, &host, &container, &disk_path, &peak2, "periodic",
                         );
                     }
                 }
@@ -783,7 +795,11 @@ impl RunObs {
     /// ts_finished 由本函数取一次钟并**同时**写进事件与索引行（单一时间源；
     /// 曾因两处各取一次钟被 checker 的互校抓出不一致——这是互校的设计目的）。
     /// 返回本 sink 累积的写错误数。
-    pub fn finish(&mut self, status: &str, run_finished_payload: &mut Value) -> Result<usize, String> {
+    pub fn finish(
+        &mut self,
+        status: &str,
+        run_finished_payload: &mut Value,
+    ) -> Result<usize, String> {
         if let Some(mut sampler) = self.sampler.take() {
             sampler.stop_and_final_sample(
                 &self.sink,
@@ -797,7 +813,8 @@ impl RunObs {
         if let Some(obj) = run_finished_payload.as_object_mut() {
             obj.insert("ts_finished".into(), json!(ts_finished));
         }
-        self.sink.write("harness.run_finished", false, run_finished_payload);
+        self.sink
+            .write("harness.run_finished", false, run_finished_payload);
         let errors = self.sink.error_count();
         self.append_index_row(status, ts_finished)?;
         Ok(errors)
@@ -820,5 +837,387 @@ impl RunObs {
             &self.fp_image_digest,
         )
         .map(|_| ())
+    }
+}
+
+// ---------- 证据更正协议（硬规则 4 的事件化落地，终审 O1） ----------
+//
+// 设计依据：设计/可观测建设方案.md §3.3 硬规则 4——观测证据派生值的修复必须三步齐全：
+//   ① 归档原字节（修复前 events.jsonl 连同其 sha256 落 observability-archive/corrections/
+//     <run_id>-<ts>/，不得只留修复后字节——2905 案例的原字节无留存即既成破口）；
+//   ② 追加更正记录：correction 事件（词表第 12 类 harness.correction，critical）记录
+//     字段名/旧值/新值/依据 rev/操作人，与 checker 词表同一次变更集扩（§1.2 纪律）；
+//   ③ 变更日志补记（流程动作，不在代码内）。
+// 语义约定：
+//   - 更正只作用于 run_finished payload 的派生字段（2905 案例形态：tokens 实算）；
+//   - 旧值由本函数从当前字节实取，不信操作者口述；
+//   - 索引行与 manifest 一律不改不重导：它们钉住的是归档原字节（checker 对含 correction
+//     的事件流的一切比对以归档文件为基准）；
+//   - correction 事件只允许追加在流末尾（run_finished 之后、既有 correction 行之后）；
+//   - 归档根的内存盘拒绝由 CLI 入口（run_obs_correct）经 resolve_root 侧校验，
+//     本函数不重复做 df 判定——单测需在临时目录构造夹具。
+
+/// 一条字段更正请求：run_finished payload 里的字段名与新值。
+pub struct FieldCorrection {
+    pub field: String,
+    pub new: Value,
+}
+
+const CORRECTION_KIND: &str = "harness.correction";
+
+/// 执行一次证据更正：归档 → 改写 run_finished 声明字段 → 追加 correction 事件。
+/// 返回追加的事件信封（含 payload），供 CLI 打印留痕。
+pub fn append_correction(
+    events_path: &Path,
+    archive_root: &Path,
+    corrections: &[FieldCorrection],
+    reason: &str,
+    basis_rev: &str,
+    operator: &str,
+) -> Result<Value, String> {
+    if corrections.is_empty() {
+        return Err("更正清单为空：拒绝空更正（无操作不入证据链）".into());
+    }
+    let data = std::fs::read(events_path)
+        .map_err(|err| format!("读 {} 失败: {err}", events_path.display()))?;
+    if data.is_empty() {
+        return Err(format!("{} 为空，拒绝更正", events_path.display()));
+    }
+    let text = String::from_utf8(data.clone())
+        .map_err(|err| format!("{} 不是 UTF-8: {err}", events_path.display()))?;
+    let mut raw_lines: Vec<&str> = text.split('\n').collect();
+    if raw_lines.last() == Some(&"") {
+        raw_lines.pop();
+    }
+    let mut events: Vec<Value> = Vec::with_capacity(raw_lines.len());
+    for (idx, line) in raw_lines.iter().enumerate() {
+        let v: Value = serde_json::from_str(line).map_err(|err| {
+            format!(
+                "{} 第 {} 行不是合法 JSON（先修撕裂再更正）: {err}",
+                events_path.display(),
+                idx + 1
+            )
+        })?;
+        events.push(v);
+    }
+    // 定位最后一个 run_finished；其后的行必须已全部是 correction（更正只追加在流尾）。
+    let fin_idx = events
+        .iter()
+        .rposition(|ev| ev.get("kind").and_then(Value::as_str) == Some("harness.run_finished"))
+        .ok_or("事件流里没有 harness.run_finished（终态未落），拒绝更正")?;
+    for ev in &events[fin_idx + 1..] {
+        if ev.get("kind").and_then(Value::as_str) != Some(CORRECTION_KIND) {
+            return Err(
+                "run_finished 之后存在非 correction 事件：correction 只允许追加在流尾".into(),
+            );
+        }
+    }
+    // run_id 取流首 run_started，且与 run_finished 一致才动笔。
+    let run_id = events
+        .first()
+        .and_then(|ev| ev.get("payload"))
+        .and_then(|p| p.get("run_id"))
+        .and_then(Value::as_str)
+        .ok_or("流首事件缺 payload.run_id")?
+        .to_string();
+    let fin_same_run = events[fin_idx]
+        .get("payload")
+        .and_then(|p| p.get("run_id"))
+        .and_then(Value::as_str)
+        .map(|rid| rid == run_id)
+        .unwrap_or(false);
+    if !fin_same_run {
+        return Err("run_finished.payload.run_id 与 run_started 不一致，拒绝更正".into());
+    }
+    // 旧值从当前字节实取；字段必须已存在（null 旧值合法——null 是值，缺键不是）。
+    let finished_payload = events[fin_idx]
+        .get("payload")
+        .and_then(Value::as_object)
+        .ok_or("run_finished payload 不是对象")?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut recorded: Vec<Value> = Vec::with_capacity(corrections.len());
+    for c in corrections {
+        if !seen.insert(c.field.clone()) {
+            return Err(format!("字段 {} 在更正清单里重复", c.field));
+        }
+        let old = finished_payload
+            .get(&c.field)
+            .ok_or_else(|| format!("run_finished 缺字段 {}（更正只改已存在字段）", c.field))?
+            .clone();
+        recorded.push(json!({"field": c.field, "old": old, "new": c.new.clone()}));
+    }
+    // ① 归档原字节。
+    let run_id_seg = sanitize_segment(&run_id, "run_id")?;
+    let ts = now_ms();
+    // 同毫秒/同 run 二次更正不覆写前一次归档（D-20 避让纪律同款）：目录已存在即 -k2 递增。
+    let mut dir = archive_root
+        .join("corrections")
+        .join(format!("{run_id_seg}-{ts}"));
+    let mut n = 1u32;
+    while dir.exists() {
+        n += 1;
+        dir = archive_root
+            .join("corrections")
+            .join(format!("{run_id_seg}-{ts}-k{n}"));
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("建归档目录 {} 失败: {err}", dir.display()))?;
+    let original_sha = sha256_bytes(&data);
+    std::fs::write(dir.join("events.jsonl"), &data)
+        .map_err(|err| format!("归档原字节写 {} 失败: {err}", dir.display()))?;
+    std::fs::write(dir.join("original.sha256"), format!("{original_sha}\n"))
+        .map_err(|err| format!("写 original.sha256 失败: {err}"))?;
+    let archived_path = dir.join("events.jsonl");
+    // ② 改写 run_finished 行 + 追加 correction 事件（seq 沿用流内计数严格 +1）。
+    let mut new_finished = events[fin_idx].clone();
+    if let Some(payload) = new_finished
+        .get_mut("payload")
+        .and_then(Value::as_object_mut)
+    {
+        for c in corrections {
+            payload.insert(c.field.clone(), c.new.clone());
+        }
+    }
+    let last_seq = events
+        .last()
+        .and_then(|ev| ev.get("seq"))
+        .and_then(Value::as_u64)
+        .ok_or("末事件缺合法 seq")?;
+    let correction_event = json!({
+        "ts_ms": ts,
+        "seq": last_seq + 1,
+        "level": "critical",
+        "kind": CORRECTION_KIND,
+        "payload": {
+            "run_id": run_id,
+            "archived_path": archived_path.to_string_lossy(),
+            "archived_sha256": original_sha,
+            "corrections": recorded,
+            "reason": reason,
+            "basis_rev": basis_rev,
+            "operator": operator,
+        },
+    });
+    let mut out_text = String::with_capacity(data.len() + 512);
+    for (idx, raw) in raw_lines.iter().enumerate() {
+        let line_text = if idx == fin_idx {
+            new_finished.to_string()
+        } else {
+            (*raw).to_string()
+        };
+        out_text.push_str(&line_text);
+        out_text.push('\n');
+    }
+    out_text.push_str(&correction_event.to_string());
+    out_text.push('\n');
+    // 先写同目录临时文件再原子改名：半途崩溃不留撕裂证据文件（归档件仍在）。
+    let tmp_path = events_path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
+    {
+        let mut tmp = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|err| format!("开临时文件 {} 失败: {err}", tmp_path.display()))?;
+        tmp.write_all(out_text.as_bytes())
+            .and_then(|()| tmp.flush())
+            .and_then(|()| tmp.sync_data())
+            .map_err(|err| format!("写临时文件失败: {err}"))?;
+    }
+    std::fs::rename(&tmp_path, events_path)
+        .map_err(|err| format!("原子替换 {} 失败: {err}", events_path.display()))?;
+    Ok(correction_event)
+}
+
+/// CLI 更正入口的入参文件形态（--correction-json）。
+#[derive(Deserialize)]
+pub struct CorrectionRequest {
+    pub corrections: Vec<FieldCorrectionReq>,
+    pub reason: String,
+    pub basis_rev: String,
+    pub operator: String,
+}
+
+/// 单条更正请求（旧值不收——由写侧从当前字节实取）。
+#[derive(Deserialize)]
+pub struct FieldCorrectionReq {
+    pub field: String,
+    pub new: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope(seq: u64, kind: &str, payload: Value) -> Value {
+        json!({"ts_ms": 1_792_621_647_000u64 + seq, "seq": seq, "level": "normal", "kind": kind, "payload": payload})
+    }
+
+    fn write_stream(dir: &Path, events: &[Value]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut text = String::new();
+        for ev in events {
+            text.push_str(&ev.to_string());
+            text.push('\n');
+        }
+        let path = dir.join("events.jsonl");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn started(run_id: &str) -> Value {
+        envelope(0, "harness.run_started", json!({"run_id": run_id}))
+    }
+
+    fn finished(run_id: &str, tokens: u64) -> Value {
+        envelope(
+            1,
+            "harness.run_finished",
+            json!({"run_id": run_id, "tokens_input": tokens}),
+        )
+    }
+
+    #[test]
+    fn append_correction_archives_rewrites_and_records() {
+        let root = std::env::temp_dir().join(format!("af-obs-corr-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let stream_dir = root.join("runs/l/a/r1");
+        let path = write_stream(&stream_dir, &[started("r1"), finished("r1", 0)]);
+        let original_bytes = std::fs::read(&path).unwrap();
+        let archive_root = root.join("observability-archive");
+        let event = append_correction(
+            &path,
+            &archive_root,
+            &[FieldCorrection {
+                field: "tokens_input".into(),
+                new: json!(50199),
+            }],
+            "d73338e 实算回填",
+            "d73338e",
+            "test",
+        )
+        .unwrap();
+        // ① 原字节已归档且逐字节相同。
+        let archived = event
+            .pointer("/payload/archived_path")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            std::fs::read(&archived).unwrap(),
+            original_bytes,
+            "归档件必须与更正前字节逐字节相同"
+        );
+        assert!(archived.contains("observability-archive/corrections/r1-"));
+        // ② run_finished 已改写、correction 事件追加、seq 严格 +1。
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1]["payload"]["tokens_input"], json!(50199));
+        assert_eq!(lines[2]["kind"], "harness.correction");
+        assert_eq!(lines[2]["level"], "critical");
+        assert_eq!(lines[2]["seq"], 2);
+        assert_eq!(lines[2]["payload"]["corrections"][0]["old"], json!(0));
+        assert_eq!(lines[2]["payload"]["corrections"][0]["new"], json!(50199));
+        assert_eq!(
+            event.pointer("/payload/archived_sha256").unwrap(),
+            &json!(sha256_bytes(&original_bytes))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn append_correction_refuses_missing_finished_or_field() {
+        let root = std::env::temp_dir().join(format!("af-obs-corr-neg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let archive_root = root.join("archive");
+        // 无 run_finished → 拒绝。
+        let path = write_stream(&root.join("s1"), &[started("r1")]);
+        assert!(append_correction(
+            &path,
+            &archive_root,
+            &[FieldCorrection {
+                field: "x".into(),
+                new: json!(1)
+            }],
+            "r",
+            "rev",
+            "t"
+        )
+        .is_err());
+        // 字段不存在 → 拒绝（不改盘）。
+        let path = write_stream(&root.join("s2"), &[started("r1"), finished("r1", 0)]);
+        assert!(append_correction(
+            &path,
+            &archive_root,
+            &[FieldCorrection {
+                field: "nope".into(),
+                new: json!(1)
+            }],
+            "r",
+            "rev",
+            "t"
+        )
+        .is_err());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"tokens_input\":0"));
+        // 空更正清单 → 拒绝。
+        assert!(append_correction(&path, &archive_root, &[], "r", "rev", "t").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn append_correction_chains_on_prior_corrections() {
+        let root = std::env::temp_dir().join(format!("af-obs-corr-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = write_stream(&root.join("s"), &[started("r1"), finished("r1", 0)]);
+        let archive_root = root.join("archive");
+        append_correction(
+            &path,
+            &archive_root,
+            &[FieldCorrection {
+                field: "tokens_input".into(),
+                new: json!(50199),
+            }],
+            "第一次",
+            "rev1",
+            "t",
+        )
+        .unwrap();
+        // 第二次更正：旧值=第一次的新值。
+        let event = append_correction(
+            &path,
+            &archive_root,
+            &[FieldCorrection {
+                field: "tokens_input".into(),
+                new: json!(60_000),
+            }],
+            "第二次",
+            "rev2",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(event["seq"], 3);
+        assert_eq!(event["payload"]["corrections"][0]["old"], json!(50199));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[1]["payload"]["tokens_input"], json!(60_000));
+        // 两次归档都各自存在。
+        assert_eq!(
+            std::fs::read_dir(archive_root.join("corrections"))
+                .unwrap()
+                .count(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
