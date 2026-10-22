@@ -10,8 +10,8 @@ use std::process::Command;
 // fix4-obs-fix1：观测侧常量与指纹函数同源引用（判分脚本/venv 路径两份常量防漂移）。
 use crate::obs;
 // D-37 容器名实例前缀：instance = sha256(out 目录)[:8]（fix4-obs-fix1 随换装窗一并移植）。
-use sha2::{Digest, Sha256};
 use crate::tb;
+use sha2::{Digest, Sha256};
 
 /// fix4-observability：harness.judge 事件的全字段载体（红队④的实际分派位在此钉死）。
 /// judge_mode_actual 与 run.started.judge_mode_declared 不等即判分无效。
@@ -251,7 +251,11 @@ pub fn verify(
     // fix4-obs-fix1 裁决：eval 超时（timeout 击杀 exit 124）只记观测位
     // detail.eval_timeout，不在日志落标记行（fix2 D-20 的 EVAL_TIMEOUT_KILLED
     // 标记会改判分器读到的日志字节，fix1 口径日志零改动）。
-    if status.as_ref().map(|st| st.code() == Some(124)).unwrap_or(false) {
+    if status
+        .as_ref()
+        .map(|st| st.code() == Some(124))
+        .unwrap_or(false)
+    {
         detail.eval_timeout = true;
     }
     if let Err(err) = status {
@@ -287,7 +291,8 @@ pub fn verify(
                         // fix1 口径：结果行只取 resolved；其余字段为 obs 事件载体
                         // （f2p/p2p 由判分器输出的 success/failure 计数映射而来）。
                         detail.resolved = row.get("resolved").and_then(serde_json::Value::as_bool);
-                        detail.log_parsed = row.get("log_parsed").and_then(serde_json::Value::as_bool);
+                        detail.log_parsed =
+                            row.get("log_parsed").and_then(serde_json::Value::as_bool);
                         detail.env_yml_synthesized = row
                             .get("env_yml_synthesized")
                             .and_then(serde_json::Value::as_bool);

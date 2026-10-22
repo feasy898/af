@@ -551,6 +551,10 @@ fn status_label(status: &RunStatus) -> String {
 /// attempt 留在盘上（swev-<task>-<profile>-a<N>）。本函数在重试前就地收尾该 attempt
 /// 的观测流——status 取 run 实际终态（与流内终态 critical 行同值，checker 第 6 项），
 /// stop_reason 注明 gate 拒绝原因，防撕裂流（无 run_finished/无索引行）。
+// 九参=观测批次累加四件（run_ids/event_total/status_counts/write_errors）+run 上下文
+// 五件；打包成结构体要改动 obs 移植码的多处引用面，故按代码库既有实践定向放行
+// （同 run_swev 的 too_many_lines allow）。
+#[allow(clippy::too_many_arguments)]
 fn finish_gated_attempt(
     run_obs: &mut obs::RunObs,
     report: &RunReport,
