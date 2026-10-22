@@ -367,7 +367,12 @@ struct Profile {
 
 fn profile(name: &str) -> Result<Profile, String> {
     match name {
-        "mavis-m31f" => Ok(Profile {
+        // "mavis-m31f-c2"：C2 A/B 探针基建别名（p01 同款形态）——端点/模型/key/
+        // 提示词与 mavis-m31f 完全一致，仅借 --profile 名改容器名后缀
+        // （afbench-swev-<task>-<profile>，swev.rs:57-59 无臂标识）：隔离同循环
+        // 他路同题批与 C1/C3 兄弟臂的撞名面（对齐组-state §27.4⑦）。
+        // 探针基建，非测量语义变更：结果行 profile 字段如实记 mavis-m31f-c2。
+        "mavis-m31f" | "mavis-m31f-c2" => Ok(Profile {
             endpoint: EndpointSpec {
                 protocol: Protocol::AnthropicMessages,
                 base_url: "https://agent.minimaxi.com/mavis/api/v1/llm".into(),
