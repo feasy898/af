@@ -73,6 +73,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ---- fix4-align4-p1：候选②位 C1 失败后转向纪律 ----
+
+    #[test]
+    fn redirect_discipline_knob_on_appends_clause_and_off_restores_v8() {
+        // C1 同二进制 on/off 旋钮（红队 32972 issue ④ 强制条件）：off 臂
+        // user_message 侧协议必须与 v8 逐字节相同；on 臂恰好多出条款、协议原文
+        // 逐字节不动（只增不改）。
+        let on = swev_instance_protocol(true);
+        let off = swev_instance_protocol(false);
+        assert_eq!(off, SWEV_INSTANCE_PROTOCOL);
+        assert_eq!(
+            on,
+            format!("{SWEV_INSTANCE_PROTOCOL}\n\n{SWEV_REDIRECT_DISCIPLINE}")
+        );
+        assert!(on.starts_with(SWEV_INSTANCE_PROTOCOL));
+        assert_ne!(on, off);
+        // 取值面：on/off 合法，其他值必须报错（不允许静默落缺省）。
+        assert!(parse_redirect_discipline("on").unwrap());
+        assert!(!parse_redirect_discipline("off").unwrap());
+        assert!(parse_redirect_discipline("yes").is_err());
+        assert!(parse_redirect_discipline("").is_err());
+    }
+
+    #[test]
+    fn redirect_discipline_clause_stays_out_of_system_prompt_and_judge_face() {
+        // af 分工（B2 §四形态）：system 保持一行零改动，条款只进 user_message 侧；
+        // 条款不含任何 test-patch / 隐藏规格信息（未来信息红线①）。
+        assert!(!SWEV_SYSTEM_PROMPT.contains("command fails"));
+        assert!(!SWEV_SYSTEM_PROMPT.contains("SIGPIPE"));
+        assert!(!SWEV_REDIRECT_DISCIPLINE.contains("test patch"));
+        assert!(!SWEV_REDIRECT_DISCIPLINE.contains("F2P"));
+        // 条款自锚：转向/逐字重复/反刍/SIGPIPE 四要素在场（文案回归锚）。
+        assert!(SWEV_REDIRECT_DISCIPLINE.contains("state in one line"));
+        assert!(SWEV_REDIRECT_DISCIPLINE.contains("verbatim"));
+        assert!(SWEV_REDIRECT_DISCIPLINE.contains("ruminate"));
+        assert!(SWEV_REDIRECT_DISCIPLINE.contains("exit=141"));
+    }
+
     // ---- fix4-align-r2：bash 结果通道判别 ----
 
     #[test]
@@ -158,6 +196,12 @@ struct Args {
     judge_mode: String,
     /// POC-1：swev-rejudge 的存量 run 根目录。
     from: PathBuf,
+    /// 候选②位 C1（fix4-align4-p1）失败后转向纪律：swe-v 线 user_message 侧条款
+    /// 旋钮（红队 32972 issue ④/三审 32984 issue ⑥ 强制条件：同二进制 on/off 配对，
+    /// 候选①「单臂无配对」教训的同构要求）。缺省 on；off = user_message 逐字节
+    /// 还原 v8。只作用于 swe-v；TB/InjecAgent 口径不动。B2 §四形态：旗标选常量、
+    /// 只改 user_message 侧，system 保持一行。
+    redirect_discipline: bool,
 }
 
 impl Args {
@@ -174,6 +218,7 @@ impl Args {
         let mut host = "anolis".to_string();
         let mut judge_mode = "clean".to_string();
         let mut from = PathBuf::new();
+        let mut redirect_discipline = true;
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -211,6 +256,10 @@ impl Args {
                 "--host" => host = it.next().ok_or("--host 缺值")?,
                 "--judge-mode" => judge_mode = it.next().ok_or("--judge-mode 缺值")?,
                 "--from" => from = PathBuf::from(it.next().ok_or("--from 缺值")?),
+                "--redirect-discipline" => {
+                    let v = it.next().ok_or("--redirect-discipline 缺值")?;
+                    redirect_discipline = parse_redirect_discipline(&v)?;
+                }
                 other => return Err(format!("未知参数 {other}")),
             }
         }
@@ -228,7 +277,29 @@ impl Args {
             host,
             judge_mode,
             from,
+            redirect_discipline,
         })
+    }
+}
+
+/// 候选②位 C1 旋钮取值：on = 条款注入 user_message 侧；off = 对照臂（协议还原 v8）。
+fn parse_redirect_discipline(s: &str) -> Result<bool, String> {
+    match s {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(format!("--redirect-discipline 只接受 on/off（得 {other}）")),
+    }
+}
+
+/// swe-v user_message 侧协议拼装（C1 唯一注入点）：on = 协议原文 ∪ C1 条款（只增
+/// 不改）；off = 协议原文逐字节不变。system prompt（SWEV_SYSTEM_PROMPT）两侧共用
+/// 同一常量、零改动——与 p00 墙钟旋钮同型：同二进制、行级自述臂态（结果行
+/// redirect_discipline 字段），杜绝「scaffold bump 把文案效应与代际差混装」。
+fn swev_instance_protocol(redirect_discipline: bool) -> String {
+    if redirect_discipline {
+        format!("{SWEV_INSTANCE_PROTOCOL}\n\n{SWEV_REDIRECT_DISCIPLINE}")
+    } else {
+        SWEV_INSTANCE_PROTOCOL.to_string()
     }
 }
 
@@ -747,6 +818,27 @@ When your fix is verified:
 2. Submit: run a bash command that PRINTS the token TASK_COMPLETE as its FIRST output line, e.g. `echo TASK_COMPLETE`.
 Mentioning TASK_COMPLETE in plain text does NOT finish the run — only the printed output of an executed command does. After the token prints, the run ends immediately and you cannot continue working."#;
 
+/// 候选②位 C1（fix4-align4-p1）：失败后转向纪律（B2 纠错风格可迁移件的 af 原生化，
+/// 对齐组-state.md §25.1 候选台账；红队门审 node 32972 confirmed）。
+/// 注入面：仅 swe-v user_message 侧（SWEV_INSTANCE_PROTOCOL 之后追加，只增不改）；system 保持
+/// 一行（af 分工，B2 回灌移交单 §四形态）。零判分路径接触。
+///
+/// 与既有护栏的重叠分析（红队 32972 issue ①，实证见 docs/c1-redirect-discipline.md）：
+/// af 既有「逐字重复命令」硬护栏（本文件 run_swev 的 recent 窗口 6 条、同命令窗口内
+/// ≥2 前科即注入提醒）抓的是**近距离连发**；4094 三跑实测触发 0 次——35/12/7 次
+/// 逐字重复全部落在其 6 条窗口的结构盲区（重复间隔 > 窗口）。本条款覆盖的是
+/// **决策层**通道（失败语义吸收 + 转向），为既有护栏的增量而非重复采纳。
+///
+/// 依赖登记（红队 32972 issue ⑤）：exit:141 子句的收益以候选③（pipefail）落地为
+/// 前提——本二进制（v9，无 pipefail）上 SIGPIPE 被末端 tail/head 的 rc 掩蔽，模型
+/// 几乎见不到 exit=141，该子句惰性但无害（前瞻兼容）；C1 A/B 读数不得把 141 子句
+/// 计为本代收益，若 C3 同批采纳须分列臂或按预注册联合读法。
+const SWEV_REDIRECT_DISCIPLINE: &str = r#"# When a command fails
+- A failed command (non-zero exit, or a tool result flagged as an error) is evidence. Before running anything else, state in one line what this failure changed about your understanding of the problem — then act on that new understanding with a command that is actually different (different flag, different input, different target, or a different approach).
+- Do not re-run a failed command verbatim while nothing has changed: identical input yields identical output, and the repeat only burns your budget. Re-running a previously failed command is appropriate once something material changed (you edited code and re-run the same tests) — say in one line what changed.
+- Do not apologize and do not ruminate about failures. One line of diagnosis, then the next concrete step.
+- exit=141 means SIGPIPE (typically `... | head` or `| tail` closing the pipe early): it describes the pipeline, not your upstream command. Prefer writing output to a file and reading the file over re-piping the same way."#;
+
 /// fix2 反考古护栏的触发模式（失败轨迹分析 §1.3 D-考古：51/145 run、单例烧 10-20 轮）。
 /// 取证据里最明确的全库考古/全盘搜索形态，避免误伤正常源码搜索。
 const ARCHAEOLOGY_PATTERNS: &[&str] = &[
@@ -987,7 +1079,14 @@ fn run_swev(args: &Args) -> Result<(), String> {
                 Some(std::sync::Arc::new(move || resolve_key(key_cmd)));
             let opened = Opened::open(&attempt_dir).map_err(|err| format!("open run: {err}"))?;
             // fix2：纪律随任务重发（instance 模板），attempt 恒 1（无 gate 重试）。
-            let user_message = format!("{}\n\n{}", task.prompt(), SWEV_INSTANCE_PROTOCOL);
+            // fix4-align4-p1（C1）：--redirect-discipline 旋钮在此选常量——on 时
+            // user_message 侧追加转向纪律条款，off 时与 v8 逐字节相同（同二进制
+            // 配对臂的唯一差，红队 32972 issue ④ 强制条件）。
+            let user_message = format!(
+                "{}\n\n{}",
+                task.prompt(),
+                swev_instance_protocol(args.redirect_discipline)
+            );
             match opened.run(Launch {
                 spec,
                 run_id: format!("{}-a{}", task.instance_id, attempt),
@@ -1050,7 +1149,12 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         "status": "run_failed",
                         // fix4-align2-tier0：scaffold v8 = v7 − S002/S118 观测折叠
                         // （回归回退，见下方结果行注释）；v7 = v6 + S083 外置。
-                        "scaffold": "v8",
+                        // fix4-align4-p1：scaffold v9 = v8 + C1 失败后转向纪律
+                        // （纯 user_message 侧提示词条款，--redirect-discipline 旋钮
+                        // 选通；redirect_discipline 字段自述臂态，行级可比）。
+                        "scaffold": "v9",
+                        // C1（候选②位）：本行生效的条款臂态（on=注入/off=还原 v8）。
+                        "redirect_discipline": args.redirect_discipline,
                         // S151 溯源：run_failed 行同样锚定产出提交。
                         "harness_commit": harness_commit(),
                         // D-20 项 1：run_failed 行也记实际目录（trail 留在现场供复核）。
@@ -1121,7 +1225,16 @@ fn run_swev(args: &Args) -> Result<(), String> {
             // v3 原文：提交式完成协议 + instance 纪律 + 250 步/$3/温度0/top_p1/
             // max_tokens 32000 + 无 gate 重试。reasoning 档位按审计 §6.A.7 显式声明
             // （保持 Off = mini 默认不发 thinking）。
-            "scaffold": "v8",
+            // fix4-align4-p1（C1，候选②位）：scaffold v9 = v8 + 失败后转向纪律——
+            // 纯 user_message 侧提示词条款（SWEV_INSTANCE_PROTOCOL 尾部追加），由
+            // --redirect-discipline on/off 同二进制旋钮选通；本行 redirect_discipline
+            // 字段自述臂态。off 臂 user_message 与 v8 逐字节相同 ⇒ A/B 差集恰为该
+            // 条款（scaffold bump 只作代际锚定，不代替配对；红队 32972 issue ④）。
+            // 零判分路径接触；TB/InjecAgent 口径不动。重叠分析与依赖登记见
+            // docs/c1-redirect-discipline.md。
+            "scaffold": "v9",
+            // C1（候选②位）：本行生效的条款臂态（on=注入/off=还原 v8）。
+            "redirect_discipline": args.redirect_discipline,
             // S151 溯源：本结果行产自哪个 harness 提交（与 scaffold 双锚定）。
             "harness_commit": harness_commit(),
             "reasoning_tier": "off",
