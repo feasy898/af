@@ -870,13 +870,37 @@ impl Opened {
         Ok(())
     }
 
-    /// fix4-observability：读取某 run 的进度行（轮次/调用数/副作用计数）。
-    /// run 以 Err 收场（run_failed）时报告不存在，af-bench 据此回填 run.finished。
-    pub fn run_progress(&self, run_id: &str) -> Result<Option<(u32, u64, u64, u64)>> {
-        Ok(self
-            .store
-            .load(run_id)?
-            .map(|row| (row.turn_index, row.model_calls, row.effect_fresh, row.effect_replays)))
+    /// fix4-observability：读取某 run 的进度行（轮次/调用数/副作用计数/token 三本账）。
+    /// run 以 Err 收场（run_failed）时报告不存在，af-bench 据此回填 run.finished——
+    /// token 从已落库的对话快照（Assistant.usage）实算：run_failed 前的成功调用
+    /// 照样真实消耗 token（计费事实），不得落 0（smoke2 实证 68 次调用 Σinput=50199）。
+    pub fn run_progress(&self, run_id: &str) -> Result<Option<(u32, u64, u64, u64, TokenTotals)>> {
+        Ok(self.store.load(run_id)?.map(|row| {
+            let tokens = parse_stored::<Vec<TranscriptItem>>(&row.transcript_json, "对话快照")
+                .map(|transcript| {
+                    let mut tokens = TokenTotals::default();
+                    for item in &transcript {
+                        if let TranscriptItem::Assistant {
+                            usage: Some(u), ..
+                        } = item
+                        {
+                            tokens.input = tokens.input.saturating_add(u.input_tokens);
+                            tokens.output = tokens.output.saturating_add(u.output_tokens);
+                            tokens.cache_read =
+                                tokens.cache_read.saturating_add(u.cache_read_tokens);
+                        }
+                    }
+                    tokens
+                })
+                .unwrap_or_default();
+            (
+                row.turn_index,
+                row.model_calls,
+                row.effect_fresh,
+                row.effect_replays,
+                tokens,
+            )
+        }))
     }
 }
 

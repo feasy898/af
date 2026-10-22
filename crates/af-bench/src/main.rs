@@ -918,18 +918,20 @@ fn run_swev(args: &Args) -> Result<(), String> {
                     // fix4-observability：run_failed 收尾——无 RunReport，进度从 harness.db 回读。
                     // 红队⑤修复：finish/索引失败只告警，不再中止整批。
                     if let Some(run_obs) = run_obs_opt.as_mut() {
+                        // 红队③互校 + smoke2 实证修复：run_failed 的 token 从 harness.db
+                        // 对话快照实算——失败前的成功调用真实消耗 token（计费事实），不得落 0。
                         let progress = opened.run_progress(&run_obs.sink.run_id).unwrap_or(None);
-                        let (turns, model_calls, eff_fresh, eff_replays) =
-                            progress.unwrap_or((0, 0, 0, 0));
+                        let (turns, model_calls, eff_fresh, eff_replays, tokens) =
+                            progress.unwrap_or_default();
                         let mut run_finished = json!({
                             "run_id": run_obs.sink.run_id,
                             // ts_finished 由 RunObs::finish 注入（事件与索引行同一时刻值）。
                             "wall_ms": obs::now_ms().saturating_sub(run_obs.ts_started),
                             "turns": turns,
                             "model_calls": model_calls,
-                            "tokens_input": 0,
-                            "tokens_output": 0,
-                            "tokens_cache_read": 0,
+                            "tokens_input": tokens.input,
+                            "tokens_output": tokens.output,
+                            "tokens_cache_read": tokens.cache_read,
                             "http_retries": http_retries,
                             "effect_fresh": eff_fresh,
                             "effect_replays": eff_replays,
