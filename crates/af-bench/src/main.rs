@@ -139,6 +139,18 @@ mod tests {
         assert_eq!(rc, None);
         assert_eq!(body, "no marker here");
     }
+
+    #[test]
+    fn wall_timeout_knob_defaults_to_mcode_equal_and_zero_disables() {
+        // 候选①双轨预算制：缺省 = mcode 等额 1800s；0 = 关墙钟（对照臂）。
+        assert_eq!(SWEV_WALL_TIMEOUT_SECS_DEFAULT, 1_800);
+        assert_eq!(
+            swev_wall_timeout(SWEV_WALL_TIMEOUT_SECS_DEFAULT),
+            Some(1_800)
+        );
+        assert_eq!(swev_wall_timeout(0), None);
+        assert_eq!(swev_wall_timeout(900), Some(900));
+    }
 }
 
 // ---------- CLI ----------
@@ -158,6 +170,10 @@ struct Args {
     judge_mode: String,
     /// POC-1：swev-rejudge 的存量 run 根目录。
     from: PathBuf,
+    /// 候选①（第2循环第1轮）双轨预算制：swe-v 线墙钟上限（秒）。缺省 1800s 与
+    /// 商业 mcode 线 os_timeout 等额；0 = 关墙钟（对照臂量化 1800s 硬切面，
+    /// 对齐组-state §7.3⑨）。只作用于 swe-v；TB/InjecAgent 口径不动。
+    wall_timeout_secs: u64,
 }
 
 impl Args {
@@ -174,6 +190,7 @@ impl Args {
         let mut host = "anolis".to_string();
         let mut judge_mode = "clean".to_string();
         let mut from = PathBuf::new();
+        let mut wall_timeout_secs = SWEV_WALL_TIMEOUT_SECS_DEFAULT;
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -211,6 +228,13 @@ impl Args {
                 "--host" => host = it.next().ok_or("--host 缺值")?,
                 "--judge-mode" => judge_mode = it.next().ok_or("--judge-mode 缺值")?,
                 "--from" => from = PathBuf::from(it.next().ok_or("--from 缺值")?),
+                "--wall-timeout-secs" => {
+                    wall_timeout_secs = it
+                        .next()
+                        .ok_or("--wall-timeout-secs 缺值")?
+                        .parse()
+                        .map_err(|_| "--wall-timeout-secs 不是非负整数")?
+                }
                 other => return Err(format!("未知参数 {other}")),
             }
         }
@@ -228,8 +252,19 @@ impl Args {
             host,
             judge_mode,
             from,
+            wall_timeout_secs,
         })
     }
+}
+
+/// 候选①（第2循环第1轮）双轨预算制的墙钟缺省：1800s 与商业 mcode 线
+/// os_timeout 等额（对齐组-state §4.1 探针证据：mcode 同题在 1800s 内走完全流程）。
+/// `--wall-timeout-secs 0` 关墙钟跑对照臂，量化 1800s 硬切面（§7.3⑨ 待管项）。
+const SWEV_WALL_TIMEOUT_SECS_DEFAULT: u64 = 1_800;
+
+/// CLI 值 → Policy 值：0 = 不限墙钟（None），正数 = Some(n)。
+fn swev_wall_timeout(secs: u64) -> Option<u64> {
+    (secs > 0).then_some(secs)
 }
 
 /// bash 工具的超时（秒）：从工具入参 `timeout_ms` 取，缺省 180s，上限 600s。
@@ -937,12 +972,13 @@ fn run_swev(args: &Args) -> Result<(), String> {
                 policy: Policy {
                     // fix2 对齐（审计 §6.A.1）：60 → 250 步（1 turn = 1 模型调用，与 mini step 同义）。
                     max_turns: 250,
-                    // fix4 对齐（fix4-align-r1）：墙钟预算 1800s——商业 mcode 线同一模型
-                    // 在 os_timeout=1800s 内能走完定位→修改→验证全流程，af 的纯调用数
-                    // 预算却把成批 run 硬切在半路（fix1 代际 76/132 终态 max_turns，
-                    // 墙钟中位 1112s/992s 远未到 1800s，瓶颈是调用次数而非时间）。
-                    // 时间成为约束后与商业线同口径：同样 30 分钟，够就走完全流程。
-                    wall_timeout_secs: Some(1_800),
+                    // 候选①（第2循环第1轮）双轨预算制：max_turns 轮次上限与墙钟上限
+                    // 并存——250 步管「无限再验一组」，墙钟管「烧时间」。墙钟缺省
+                    // 1800s 与商业 mcode 线 os_timeout 等额（--wall-timeout-secs 可调，
+                    // 0=关，对照臂用）；双轨收尾提醒各恰好一次（轮：剩10%/剩4%；
+                    // 墙：剩 300s/剩 120s）。drive() 内 max_turns 先判，两限同时到期
+                    // 时轮次上限优先（tests.rs 矩阵测试钉死）。
+                    wall_timeout_secs: swev_wall_timeout(args.wall_timeout_secs),
                     stop: StopCondition {
                         completion_signals: vec!["TASK_COMPLETE".into()],
                         tool_free_turn_limit: 3,
@@ -1034,6 +1070,9 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         // （墙钟 1800s + 指纹刹车 + bash is_error 负反馈 + 离线三通道
                         // + 空响应护栏），机制清单见下方结果行注释。
                         "scaffold": "v6",
+                        // 候选①双轨预算制：本行生效的墙钟上限（0=关）。非 1800 的
+                        // 对照臂以本字段自述，行级可比。
+                        "wall_timeout_secs": args.wall_timeout_secs,
                         // D-20 项 1：run_failed 行也记实际目录（trail 留在现场供复核）。
                         "run_dir": attempt_dir.display().to_string(),
                         "eval_sha256": Value::Null,
@@ -1094,6 +1133,9 @@ fn run_swev(args: &Args) -> Result<(), String> {
             // （保持 Off = mini 默认不发 thinking）。
             "scaffold": "v6",
             "reasoning_tier": "off",
+            // 候选①双轨预算制：本行生效的墙钟上限（0=关）。非 1800 的对照臂以本
+            // 字段自述；缺省 1800=mcode 等额，与 agent_wall_ms 对读即可审计硬切面。
+            "wall_timeout_secs": args.wall_timeout_secs,
             // D-20 项 1：实际 run 目录（重跑按序号递增，不再同名覆写）。
             "run_dir": run_dir.display().to_string(),
             // D-20 项 2：eval.log sha256（判分时计算，判分复核可逐字节对账）。

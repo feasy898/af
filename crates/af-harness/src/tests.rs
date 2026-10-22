@@ -840,6 +840,28 @@ fn wall_timeout_absent_by_default_keeps_legacy_behavior() {
 }
 
 #[test]
+fn max_turns_fires_when_turns_exhaust_before_wall_clock() {
+    // 候选①双轨预算制矩阵收尾：两轨并存、轮次先耗尽 → MaxTurns 胜出
+    // （drive() 内 max_turns 先于墙钟判定，两限同到期时结果确定）。
+    let fix = Fixture::new();
+    let stub = StubServer::spawn().unwrap();
+    let mut spec = spec_at(&stub.url());
+    spec.policy.max_turns = 2;
+    spec.policy.wall_timeout_secs = Some(3_600);
+    spec.policy.stop.completion_signals.clear();
+    spec.policy.stop.tool_free_turn_limit = 8;
+    stub.push(StubResponse::json(200, assistant_text("第一轮")));
+    stub.push(StubResponse::json(200, assistant_text("第二轮")));
+    let opened = Opened::open_with_clock(&fix.dir, fix.clock.clone()).unwrap();
+    let report = opened.run(fix.launch(spec, ToolRegistry::new())).unwrap();
+    match report.status {
+        RunStatus::MaxTurns => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(report.model_calls, 2);
+}
+
+#[test]
 fn repeated_identical_tool_call_stops_the_run_even_when_ok() {
     // fix4 主场景：bash 类工具恒以 Ok 结算（fix1 代际 9583 条 tool 记录 0 error），
     // 逐字重复同一调用 3 次必须被指纹连击刹车停住，而不是烧到 max_turns。
