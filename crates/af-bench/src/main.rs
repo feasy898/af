@@ -28,6 +28,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+// fix4-obs-fix1 裁决：不引入 mod judge（fix3 干净判分容器模块，fix1 代际无此文件；
+// 判分在 swev.rs 的 verify 原地执行）。观测模块照搬。
+mod obs;
 mod swev;
 mod tb;
 
@@ -511,6 +514,50 @@ fn status_label(status: &RunStatus) -> String {
     }
 }
 
+/// fix4-obs-fix1：fix1 的 gate 反馈重试（零补丁/改测试门禁，attempt≤2）会把被拒的
+/// attempt 留在盘上（swev-<task>-<profile>-a<N>）。本函数在重试前就地收尾该 attempt
+/// 的观测流——status 取 run 实际终态（与流内终态 critical 行同值，checker 第 6 项），
+/// stop_reason 注明 gate 拒绝原因，防撕裂流（无 run_finished/无索引行）。
+fn finish_gated_attempt(
+    run_obs: &mut obs::RunObs,
+    report: &RunReport,
+    http_retries: u64,
+    gate_reason: &str,
+    attempt: u32,
+    obs_run_ids: &mut Vec<String>,
+    obs_event_total: &mut u64,
+    obs_status_counts: &mut BTreeMap<String, u64>,
+    obs_write_errors: &mut usize,
+) -> Result<(), String> {
+    let status = status_label(&report.status);
+    let mut run_finished = json!({
+        "run_id": run_obs.sink.run_id,
+        // ts_finished 由 RunObs::finish 注入（事件与索引行同一时刻值）。
+        "wall_ms": obs::now_ms().saturating_sub(run_obs.ts_started),
+        "turns": report.turns,
+        "model_calls": report.model_calls,
+        "tokens_input": report.tokens.input,
+        "tokens_output": report.tokens.output,
+        "tokens_cache_read": report.tokens.cache_read,
+        "http_retries": http_retries,
+        "effect_fresh": report.effect_fresh,
+        "effect_replays": report.effect_replays,
+        "status": status,
+        "stop_reason": format!(
+            "{gate_reason}（attempt {attempt} 被 harness 门禁拒绝，带反馈重试）；{}",
+            serde_json::to_string(&report.status).unwrap_or_default()
+        ),
+    });
+    match run_obs.finish(&status, &mut run_finished) {
+        Ok(errs) => *obs_write_errors += errs,
+        Err(e) => return Err(format!("观测索引落盘失败: {e}")),
+    }
+    obs_run_ids.push(run_obs.sink.run_id.clone());
+    *obs_event_total += run_obs.sink.count();
+    *obs_status_counts.entry(status).or_insert(0) += 1;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn run() -> Result<(), String> {
     let args = Args::parse()?;
@@ -526,6 +573,22 @@ fn run() -> Result<(), String> {
 
 fn run_swev(args: &Args) -> Result<(), String> {
     let prof = profile(&args.profile)?;
+    // fix4-observability：观测根与批次标识（D-24：根目录绝不入内存盘，resolve_root 强制校验）。
+    let obs_root = obs::resolve_root()?;
+    let batch_id = std::env::var("AF_OBS_BATCH_ID").unwrap_or_else(|_| {
+        format!("b-{}-{}", obs::now_ms(), std::process::id())
+    });
+    let obs_line = std::env::var("AF_OBS_LINE").unwrap_or_else(|_| "default".into());
+    let obs_arm = std::env::var("AF_OBS_ARM").unwrap_or_else(|_| args.profile.clone());
+    let mut obs_run_ids: Vec<String> = Vec::new();
+    let mut obs_event_total: u64 = 0;
+    let mut obs_status_counts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut obs_write_errors: usize = 0;
+    // fix4-obs-fix1：run_started 事件记录端点实际形态（fix1 口径=档案缺省值，
+    // 不施加 fix2 的 temperature/top_p/max_tokens 显式覆写）。
+    let endpoint = prof.endpoint.clone();
+    // fix4-obs-fix1 裁决：不移植 fix2 采样参数对齐块（temperature 0.0/top_p 1.0/
+    // max_tokens 32000）——fix1 口径吃档案/端点缺省值，显式覆写=测量语义变更。
     if args.tasks.is_empty() {
         return Err("swe-v 需要 --tasks <instance_id 逗号表>".into());
     }
@@ -584,6 +647,13 @@ fn run_swev(args: &Args) -> Result<(), String> {
         let mut http_retries: u64 = 0;
         let report;
         let run_dir;
+        // fix4-observability：run_obs 槽位——成功路径经槽位传出（失败路径就地收尾）。
+        // fix4-obs-fix1 裁决：attempt 保持 fix1 口径=进程内 gate 重试计数（1→2，见上
+        // 「v2 完成度纪律」注），不改用 run 目录序号语义（D-20 项 1 属 fix2；
+        // 且 fix1 的 gate 重试会在同进程内产生 a1/a2 两个 run）。
+        // 唯一落到槽位的路径是 break 前的赋值（gate 重试 continue 不回读、Err 路径
+        // continue 'task 不回读），故不初始化为 None（避免 unused_assignment）。
+        let run_obs_slot: Option<obs::RunObs>;
         loop {
             let env_for_tool = env_cell.clone();
             let recent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -647,18 +717,106 @@ fn run_swev(args: &Args) -> Result<(), String> {
             let key_refresh: Option<af_harness::KeyRefresher> =
                 Some(std::sync::Arc::new(move || resolve_key(key_cmd)));
             let opened = Opened::open(&attempt_dir).map_err(|err| format!("open run: {err}"))?;
+            // fix4-obs-fix1 裁决：user_message 保持 fix1 口径（attempt==1 用纯任务提示词，
+            // gate 重试轮追加 harness 反馈）——fix2 的 SWEV_INSTANCE_PROTOCOL 随任务重发
+            // 属提示词变更，不移植。
             let user_message = if attempt == 1 {
                 task.prompt()
             } else {
                 format!("{}\n\n{}", task.prompt(), gate_feedback)
             };
+            // ---- fix4-observability：建观测流（先建流取最终 run_id）→ 采指纹 → run_started 首行 ----
+            let launch_run_id = format!("{}-a{}", task.instance_id, attempt);
+            let mut run_obs = obs::RunObs::begin(
+                &obs_root,
+                &obs_line,
+                &obs_arm,
+                &launch_run_id,
+                &args.host,
+                &env_cell.container,
+            )
+            .map_err(|err| format!("观测流初始化失败: {err}"))?;
+            let fp_image_ref = task.image.clone();
+            let (fp_image_digest, fp_image_digest_source) =
+                obs::image_digest(&args.host, &fp_image_ref)
+                    .map_err(|err| format!("镜像 digest 采集失败: {err}"))?;
+            let fp_task_sha256 = obs::sha256_file(&args.data_root.join(format!(
+                "{}.json",
+                task.instance_id
+            )))?;
+            let fp_prompt_sha256 = obs::sha256_bytes(user_message.as_bytes());
+            let fp_judge_script_sha256 = obs::sha256_file(Path::new(obs::JUDGE_PY))?;
+            static JUDGE_ENV: std::sync::OnceLock<Result<(String, String), String>> =
+                std::sync::OnceLock::new();
+            let (fp_judge_env_sha256, _env_note) = JUDGE_ENV
+                .get_or_init(obs::judge_env_fingerprint)
+                .clone()
+                .map_err(|err| format!("判分环境指纹采集失败: {err}"))?;
+            static SWEB_VER: std::sync::OnceLock<Result<String, String>> =
+                std::sync::OnceLock::new();
+            let swebench_version = SWEB_VER
+                .get_or_init(obs::swebench_version)
+                .clone()
+                .map_err(|err| format!("swebench 版本自报失败: {err}"))?;
+            static BIN_SHA: std::sync::OnceLock<Result<String, String>> =
+                std::sync::OnceLock::new();
+            let bench_binary_sha256 = BIN_SHA
+                .get_or_init(obs::bench_binary_sha256)
+                .clone()
+                .map_err(|err| format!("二进制指纹采集失败: {err}"))?;
+            static GIT_REV: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            let harness_git_rev = GIT_REV.get_or_init(obs::harness_git_rev).clone();
+            let run_started = json!({
+                "run_id": run_obs.sink.run_id,
+                "instance_id": task.instance_id,
+                "line": obs_line,
+                "arm": obs_arm,
+                "profile": args.profile,
+                "host": args.host,
+                // 单一时间源：与索引行同用 run_obs.ts_started（checker 互校位，红队⑦拆分位）。
+                "ts_started": run_obs.ts_started,
+                "model": endpoint.model,
+                "base_url": endpoint.base_url,
+                "reasoning_tier": serde_json::to_value(endpoint.reasoning_tier).unwrap_or(json!("off")),
+                "stream": endpoint.stream,
+                "max_tokens": endpoint.max_tokens,
+                "temperature_milli": endpoint.temperature_milli,
+                "top_p_milli": endpoint.top_p_milli,
+                "max_turns": spec.policy.max_turns,
+                "tool_free_turn_limit": spec.policy.stop.tool_free_turn_limit,
+                "completion_signals": spec.policy.stop.completion_signals,
+                "per_turn_budget_cents": spec.policy.budget_ref.per_turn,
+                // fix4-obs-fix1 裁决：spend_cap_cents 记 Launch 实际值（fix1=100；
+                // 300 为 fix2/fix3 口径），tool_spend_cents 同 Launch=1。
+                "spend_cap_cents": 100,
+                "tool_spend_cents": 1,
+                // fix4-obs-fix1 裁决：scaffold/judge_mode_declared 按 fix1 实际形态填
+                // （scaffold=v2；原地判分无 --judge-mode 旗标，declared 为常量 "in-place"，
+                // 与 swev::verify 的 judge_mode_actual="in-place" 互证——checker 第 5 项同判）。
+                "scaffold": "v2",
+                "judge_mode_declared": "in-place",
+                "bench_binary_sha256": bench_binary_sha256,
+                "harness_git_rev": harness_git_rev,
+                "fp_image_ref": fp_image_ref,
+                "fp_image_digest": fp_image_digest,
+                "fp_image_digest_source": fp_image_digest_source,
+                "fp_task_sha256": fp_task_sha256,
+                "fp_prompt_sha256": fp_prompt_sha256,
+                "fp_judge_script_sha256": fp_judge_script_sha256,
+                "fp_judge_env_sha256": fp_judge_env_sha256,
+                "swebench_version": swebench_version,
+            });
+            run_obs.set_image_digest(fp_image_digest);
+            run_obs.emit_run_started(&run_started);
+            let obs_hook = run_obs.obs_hook();
             match opened.run(Launch {
                 spec,
-                run_id: format!("{}-a{}", task.instance_id, attempt),
+                run_id: run_obs.sink.run_id.clone(),
                 vars: BTreeMap::new(),
                 user_message,
                 key: EndpointKey::new(key),
                 key_refresh,
+                obs: Some(obs_hook),
                 parent: &root.token,
                 public_key: &root.keypair.public(),
                 namespace: "bench".into(),
@@ -682,6 +840,17 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         if diff.trim().is_empty() {
                             gate = "no_patch".into();
                             gate_feedback = "[Harness feedback] Your previous attempt ended without changing any file. You MUST edit repository files to fix the issue — a run with no code changes is an automatic failure.".into();
+                            finish_gated_attempt(
+                                &mut run_obs,
+                                &r,
+                                http_retries,
+                                "gate_no_patch",
+                                attempt,
+                                &mut obs_run_ids,
+                                &mut obs_event_total,
+                                &mut obs_status_counts,
+                                &mut obs_write_errors,
+                            )?;
                             attempt += 1;
                             continue;
                         }
@@ -692,16 +861,58 @@ fn run_swev(args: &Args) -> Result<(), String> {
                                 "[Harness feedback] Your previous attempt modified test files ({}), which is forbidden: the grading harness owns the tests and rejects any patch that touches them. Re-do the fix changing only non-test source files.",
                                 hits.join(", ")
                             );
+                            finish_gated_attempt(
+                                &mut run_obs,
+                                &r,
+                                http_retries,
+                                "gate_test_edit",
+                                attempt,
+                                &mut obs_run_ids,
+                                &mut obs_event_total,
+                                &mut obs_status_counts,
+                                &mut obs_write_errors,
+                            )?;
                             attempt += 1;
                             continue;
                         }
                     }
                     report = r;
                     run_dir = attempt_dir;
+                    // fix4-obs-fix1：观测流经槽位传出（'run 块不适用——fix1 的 loop 需支持
+                    // gate 重试 continue，故用 Option 槽位）。
+                    run_obs_slot = Some(run_obs);
                     break;
                 }
                 Err(err) => {
                     http_retries += opened.http_retries();
+                    // fix4-observability：run_failed 收尾——无 RunReport，进度从 harness.db 回读。
+                    let progress = opened.run_progress(&run_obs.sink.run_id).unwrap_or(None);
+                    let (turns, model_calls, eff_fresh, eff_replays) =
+                        progress.unwrap_or((0, 0, 0, 0));
+                    let mut run_finished = json!({
+                        "run_id": run_obs.sink.run_id,
+                        // ts_finished 由 RunObs::finish 注入（事件与索引行同一时刻值）。
+                        "wall_ms": obs::now_ms().saturating_sub(run_obs.ts_started),
+                        "turns": turns,
+                        "model_calls": model_calls,
+                        "tokens_input": 0,
+                        "tokens_output": 0,
+                        "tokens_cache_read": 0,
+                        "http_retries": http_retries,
+                        "effect_fresh": eff_fresh,
+                        "effect_replays": eff_replays,
+                        "status": "run_failed",
+                        "stop_reason": err.to_string().chars().take(2048).collect::<String>(),
+                    });
+                    match run_obs.finish("run_failed", &mut run_finished) {
+                        Ok(errs) => obs_write_errors += errs,
+                        Err(e) => return Err(format!("观测索引落盘失败: {e}")),
+                    }
+                    obs_run_ids.push(run_obs.sink.run_id.clone());
+                    obs_event_total += run_obs.sink.count();
+                    *obs_status_counts
+                        .entry("run_failed".to_string())
+                        .or_insert(0) += 1;
                     env_cell.cleanup();
                     infra += 1;
                     let row = json!({
@@ -728,9 +939,67 @@ fn run_swev(args: &Args) -> Result<(), String> {
                 }
             }
         }
+        let mut run_obs = match run_obs_slot {
+            Some(obs) => obs,
+            None => continue 'task, // run_failed 路径已在块内收尾并 continue
+        };
         let agent_wall_ms = task_started.elapsed().as_millis() as u64;
         let task_json = args.data_root.join(format!("{}.json", task.instance_id));
-        let (resolved, note) = swev::verify(&args.host, &env_cell, task, &run_dir, &task_json);
+        // fix4-obs-fix1：判分走 fix1 的 swev::verify（anolis agent 容器原地判分，
+        // 返回结构化 JudgeDetail）——fix3 的判分模式 CLI 开关与干净判分容器路径均不移植。
+        let detail = swev::verify(&args.host, &env_cell, task, &run_dir, &task_json);
+        let resolved = detail.resolved;
+        let note = detail.note.clone();
+        // fix4-obs-fix1 裁决：不设 eval_sha256 局部变量——fix2 D-20 项 2 把它加进
+        // 结果行属 schema 变更，fix1 的 15 键结果行逐键冻结（eval 日志指纹只在
+        // judge 事件 payload 内携带，观测走 sidecar 不进判分账本）。
+        // fix4-observability：harness.judge（critical）——判分环境身份+失败证据的全字段载体；
+        // judge_mode_actual 与 run.started.judge_mode_declared 不等即判分无效（红队④）。
+        let judge_payload = json!({
+            "run_id": run_obs.sink.run_id,
+            "judge_mode_actual": detail.judge_mode_actual,
+            "resolved": detail.resolved,
+            "f2p_pass": detail.f2p_pass,
+            "f2p_total": detail.f2p_total,
+            "p2p_pass": detail.p2p_pass,
+            "p2p_total": detail.p2p_total,
+            "log_parsed": detail.log_parsed,
+            "tests_collected": detail.tests_collected,
+            "env_yml_synthesized": detail.env_yml_synthesized,
+            "judge_exit_code": detail.judge_exit_code,
+            "judge_stderr": detail.judge_stderr,
+            "eval_timeout": detail.eval_timeout,
+            "eval_sha256": detail.eval_sha256,
+            "judge_raw": detail.judge_raw,
+            "judge_container": detail.judge_container,
+            "swebench_version": detail.swebench_version,
+        });
+        run_obs.sink.write("harness.judge", true, &judge_payload);
+        // fix4-observability：run_finished 汇总行（先停采样器强制补采——容器此时仍活着，
+        // 再写 finished 与索引行；status 必须引用 harness.stop/budget/unauthorized 终态行同值）。
+        let finished_status = status_label(&report.status);
+        let mut run_finished = json!({
+            "run_id": run_obs.sink.run_id,
+            // ts_finished 由 RunObs::finish 注入（事件与索引行同一时刻值）。
+            "wall_ms": obs::now_ms().saturating_sub(run_obs.ts_started),
+            "turns": report.turns,
+            "model_calls": report.model_calls,
+            "tokens_input": report.tokens.input,
+            "tokens_output": report.tokens.output,
+            "tokens_cache_read": report.tokens.cache_read,
+            "http_retries": http_retries,
+            "effect_fresh": report.effect_fresh,
+            "effect_replays": report.effect_replays,
+            "status": finished_status,
+            "stop_reason": serde_json::to_string(&report.status).unwrap_or_default(),
+        });
+        match run_obs.finish(&finished_status, &mut run_finished) {
+            Ok(errs) => obs_write_errors += errs,
+            Err(e) => return Err(format!("观测索引落盘失败: {e}")),
+        }
+        obs_run_ids.push(run_obs.sink.run_id.clone());
+        obs_event_total += run_obs.sink.count();
+        *obs_status_counts.entry(finished_status.clone()).or_insert(0) += 1;
         env_cell.cleanup();
         if resolved == Some(true) {
             pass += 1;
@@ -775,6 +1044,27 @@ fn run_swev(args: &Args) -> Result<(), String> {
             report.tokens.output,
             agent_wall_ms
         );
+    }
+    // fix4-observability：批次清单（Merkle 根，第三方可重算）+ 观测写错误面统一上报。
+    if !obs_run_ids.is_empty() {
+        let counts = serde_json::to_value(&obs_status_counts).unwrap_or_else(|_| json!({}));
+        let manifest_path = obs::write_batch_manifest(
+            &obs_root,
+            &batch_id,
+            &obs_run_ids,
+            obs_event_total,
+            &counts,
+        )?;
+        println!(
+            "obs: {} runs, {obs_event_total} events, manifest → {}",
+            obs_run_ids.len(),
+            manifest_path.display()
+        );
+    }
+    if obs_write_errors > 0 {
+        return Err(format!(
+            "观测事件流有 {obs_write_errors} 条写入失败（见 stderr），按失败处理"
+        ));
     }
     println!(
         "af-bench 完成: {} 题, resolved {pass}, infra {infra}, results → {}",
@@ -885,6 +1175,7 @@ fn run_tb(args: &Args) -> Result<(), String> {
             user_message: task.prompt.clone(),
             key: EndpointKey::new(key),
             key_refresh,
+            obs: None,
             parent: &root.token,
             public_key: &root.keypair.public(),
             namespace: "bench".into(),
@@ -1054,6 +1345,7 @@ fn run_injec(args: &Args) -> Result<(), String> {
                 user_message: task.prompt.clone(),
                 key: EndpointKey::new(key),
                 key_refresh,
+                obs: None,
                 parent: &root.token,
                 public_key: &root.keypair.public(),
                 namespace: "bench".into(),

@@ -13,6 +13,9 @@ af-stop = { path = "../af-stop" }
 af-workorder = { path = "../af-workorder" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# 观测指纹（fix4-observability 移植）：事件流 fp_* 与 eval 日志 sha256。
+# sha2 0.10.9 已是树内依赖（af-effect-gateway/af-engine 在用），不引入新第三方 crate。
+sha2 = "=0.10.9"
 thiserror = { workspace = true }
 
 [lints]
