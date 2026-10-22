@@ -89,6 +89,7 @@ pub fn setup(host: &str, task: &SwevTask, profile: &str) -> Result<tb::TbEnv, St
             task: task.instance_id.clone(),
             host: host.into(),
             workdir: "/testbed".into(),
+            out_seq: std::sync::atomic::AtomicU64::new(0),
         }),
         Ok((false, log)) => Err(format!(
             "起容器失败: {}",

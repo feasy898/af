@@ -1030,10 +1030,12 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         "trial": args.trial,
                         "reward": Value::Null,
                         "status": "run_failed",
-                        // fix4-align2（合流 bump）：scaffold v6 = v4 ∪ v5 机制并集
-                        // （墙钟 1800s + 指纹刹车 + bash is_error 负反馈 + 离线三通道
-                        // + 空响应护栏），机制清单见下方结果行注释。
-                        "scaffold": "v6",
+                        // fix4-align2-tier0（第 0 档采纳 bump）：scaffold v7 = v6
+                        // + S083 大输出外置 + S002/S118 观测折叠（keep-last-5）；
+                        // v6 = v4 ∪ v5 机制并集（墙钟 1800s + 指纹刹车 + bash
+                        // is_error 负反馈 + 离线三通道 + 空响应护栏），
+                        // 机制清单见下方结果行注释。
+                        "scaffold": "v7",
                         // D-20 项 1：run_failed 行也记实际目录（trail 留在现场供复核）。
                         "run_dir": attempt_dir.display().to_string(),
                         "eval_sha256": Value::Null,
@@ -1080,8 +1082,16 @@ fn run_swev(args: &Args) -> Result<(), String> {
             "trial": args.trial,
             "reward": resolved,
             "status": status_label(&report.status),
-            // fix4-align2（合流结果代号 bump，§7.3⑩ 机制并集）：scaffold v6
-            // = v3 + 以下并集——
+            // fix4-align2-tier0（第 0 档采纳 bump）：scaffold v7 = v6
+            // + 来自 tier0（harness策略调研 第 0 档直接采纳清单）：
+            //   · S083 大工具输出外置——超 12KiB 的 bash 输出写回容器 /tmp/.af-outputs/
+            //     （base64 分块），上下文只进「头 2000B 预览 + 路径 + 分段回读指引」，
+            //     写回失败退回有损截断（af-bench/src/tb.rs exec/externalize_output）。
+            //   · S002/S118 观测折叠——每轮请求只保留最近 5 条工具结果全文
+            //     （SWE-agent last-5 observation 窗口），更早的折叠成单行注记
+            //     （保留调用骨架与 call_id；af-harness/src/run.rs fold_observations）。
+            //   两者只影响模型可见上下文（工具侧/请求组装侧），判分链零改动。
+            // v6 = v3 + 以下并集——
             // · 来自 v4（fix4-align-r1）：墙钟预算 wall_timeout_secs=1800s 对齐商业线
             //   os_timeout + 剩 300s/120s 收尾提醒 + Event::ToolOk 入参指纹
             //   （逐字重复成功调用连击 3 次 → Stop(NoInfluence)）。
@@ -1092,7 +1102,7 @@ fn run_swev(args: &Args) -> Result<(), String> {
             // v3 原文：提交式完成协议 + instance 纪律 + 250 步/$3/温度0/top_p1/
             // max_tokens 32000 + 无 gate 重试。reasoning 档位按审计 §6.A.7 显式声明
             // （保持 Off = mini 默认不发 thinking）。
-            "scaffold": "v6",
+            "scaffold": "v7",
             "reasoning_tier": "off",
             // D-20 项 1：实际 run 目录（重跑按序号递增，不再同名覆写）。
             "run_dir": run_dir.display().to_string(),

@@ -8,6 +8,7 @@
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct TbTask {
     pub task_id: String,
@@ -96,7 +97,22 @@ pub struct TbEnv {
     pub task: String,
     pub host: String,
     pub workdir: String,
+    /// S083 外置文件序号（容器内文件名去重用）。pub(crate)：swev.rs 同 crate 组装。
+    pub(crate) out_seq: AtomicU64,
 }
+
+/// fix4-align2-tier0（第 0 档 S083：大工具输出外置）——超过 [`CAP`] 的完整输出
+/// 写回容器内 `/tmp/.af-outputs/`，上下文只进「预览 + 路径」，模型按需分段回读。
+/// 参考：Copilot CLI 默认阈值 20KiB、原输出落临时文件只回路径+预览
+/// （harness策略调研/最终报告-harness改进策略总表.md §S083）。
+/// 单文件写回上限：超大输出走 base64 分块 ssh 写回的成本失控前先放弃（退回有损截断）。
+const LARGE_OUTPUT_SAVE_CAP_BYTES: usize = 512 * 1024;
+/// base64 分块大小：72_000 字节（3 的倍数，保证分块 base64 可拼接解码）→ 96_000 字符，
+/// 远低于单条 ssh argv 的 MAX_ARG_STRLEN（128KiB）限制。
+const LARGE_OUTPUT_CHUNK_BYTES: usize = 72_000;
+/// 预览保留：头部 2000 字节 + 尾部 600 字节（尾部必须含末行 exit=N，rc 解析依赖它）。
+const LARGE_OUTPUT_PREVIEW_HEAD: usize = 2_000;
+const LARGE_OUTPUT_PREVIEW_TAIL: usize = 600;
 
 /// bash 工具单条命令的默认超时（秒）——历史口径，缺省不变。
 pub const DEFAULT_BASH_TIMEOUT_SEC: u32 = 180;
@@ -172,6 +188,7 @@ impl TbEnv {
             task: task.clone(),
             host: host.into(),
             workdir: "/app".into(),
+            out_seq: AtomicU64::new(0),
         })
     }
 
@@ -187,7 +204,10 @@ impl TbEnv {
     ///     同源教学反馈，运行继续而非死文案；
     ///   · 桥接失败 → 声明"基建瞬断、可重试"，同样不死；
     ///   · 普通非零退出不教学（失败是常态信号，逐条指点只会加噪）；
-    ///   · 截断附「换窄命令」指引（mini observation_template 同源）。
+    ///   · 截断附「换窄命令」指引（mini observation_template 同源）；
+    ///   · fix4-align2-tier0（第 0 档 S083）：超 CAP 的输出改为**外置**——完整输出
+    ///     写回容器内 /tmp/.af-outputs/（base64 分块），上下文只进「预览+路径+回读指引」；
+    ///     写回失败退回有损截断，行为不劣化于旧口径。
     ///
     /// POC-2：超时不再写死 180s——由工具入参 `timeout_ms` 决定（缺省 180s、上限 600s）。
     /// 改不动的是"被杀"这件事本身，所以恢复文案里**不再教**模型用 `timeout <secs>`
@@ -215,21 +235,56 @@ impl TbEnv {
             ));
         }
         const CAP: usize = 12_000;
-        if text.len() > CAP {
-            let keep = CAP / 2;
-            text = format!(
-                "{}\n...[output truncated: {} bytes elided. Re-run with a narrower command: pipe through head/tail/sed -n, grep for specific patterns, or redirect output to a file and read it in parts.]\n{}",
-                &text[..keep],
-                text.len() - keep * 2,
-                &text[text.len() - keep..]
-            );
-        }
+        // 末行 exit=N 先落定再截断：预览的末行必须是真实退出码，
+        // bash_result 的 split_exit_line（rfind "\nexit="）依赖这一点。
         text.push_str(&format!(
             "\nexit={}",
             rc.map(|n| n.to_string())
                 .unwrap_or_else(|| "124".to_string())
         ));
+        if text.len() > CAP {
+            // fix4-align2-tier0（第 0 档 S083）：大输出外置——完整输出写回容器内文件，
+            // 上下文只进「预览 + 路径 + 分段回读指引」。写回失败（桥接瞬断/超上限）
+            // 退回原有损截断，绝不因外置失败放大成 run 失败。
+            match self.externalize_output(&text) {
+                Ok(path) => text = large_output_preview(&text, &path),
+                Err(_) => text = lossy_truncate(&text, CAP),
+            }
+        }
         text
+    }
+
+    /// S083：把完整工具输出写回容器内 `/tmp/.af-outputs/`，返回文件路径。
+    /// base64 分块写回（每块独立 ssh 往返），任意字节安全、无引号/转义风险；
+    /// 任一块失败即整体失败（调用方退回有损截断）。
+    fn externalize_output(&self, full: &str) -> Result<String, String> {
+        if full.len() > LARGE_OUTPUT_SAVE_CAP_BYTES {
+            return Err(format!("output {} bytes exceeds save cap", full.len()));
+        }
+        let seq = self.out_seq.fetch_add(1, Ordering::Relaxed);
+        let stem = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = format!("/tmp/.af-outputs/{}-{}-{}.txt", self.task, stem, seq);
+        for (index, chunk) in full.as_bytes().chunks(LARGE_OUTPUT_CHUNK_BYTES).enumerate() {
+            let op = if index == 0 { ">" } else { ">>" };
+            let script = format!(
+                "docker exec {} bash -c {}",
+                self.container,
+                shell_quote(&format!(
+                    "mkdir -p /tmp/.af-outputs && echo {} | base64 -d {} {}",
+                    b64_encode(chunk),
+                    op,
+                    path
+                ))
+            );
+            let (ok, log) = ssh(&self.host, &script, 60)?;
+            if !ok {
+                return Err(tail(&log, 200));
+            }
+        }
+        Ok(path)
     }
 
     /// 判分：/app 提取 → 验证器镜像 → 挂载跑 test.sh → reward.txt。
@@ -315,6 +370,83 @@ fn tail(text: &str, cap: usize) -> String {
     }
 }
 
+/// UTF-8 安全的前缀截取（原实现 `&text[..keep]` 在多字节边界会 panic——顺手修正）。
+fn safe_prefix(text: &str, cap: usize) -> &str {
+    if text.len() <= cap {
+        return text;
+    }
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// UTF-8 安全的后缀截取（末行 exit=N 必须保留在结果里）。
+fn safe_suffix(text: &str, cap: usize) -> &str {
+    if text.len() <= cap {
+        return text;
+    }
+    let mut start = text.len() - cap;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+/// S083 预览：头 2000 字节 + 外置文件路径与分段回读指引 + 尾 600 字节（含末行 exit=N）。
+/// 纯函数，单测覆盖格式契约（路径出现、exit 行在末、字节数如实）。
+fn large_output_preview(full: &str, path: &str) -> String {
+    format!(
+        "{}\n...[harness] Output truncated for context economy. The full {}-byte output was saved by the harness to `{}` inside this container. Read it back in segments when needed, e.g. `sed -n '1,200p' {}` or `grep -n PATTERN {}`. The final line below is the command's real exit status.\n{}",
+        safe_prefix(full, LARGE_OUTPUT_PREVIEW_HEAD),
+        full.len(),
+        path,
+        path,
+        path,
+        safe_suffix(full, LARGE_OUTPUT_PREVIEW_TAIL)
+    )
+}
+
+/// 有损截断退路（S083 外置失败时）：头尾各留 cap/2，中段省略量如实标注。
+fn lossy_truncate(text: &str, cap: usize) -> String {
+    let keep = cap / 2;
+    let head = safe_prefix(text, keep);
+    let tail_part = safe_suffix(text, keep);
+    format!(
+        "{}\n...[output truncated: {} bytes elided. Re-run with a narrower command: pipe through head/tail/sed -n, grep for specific patterns, or redirect output to a file and read it in parts.]\n{}",
+        head,
+        text.len() - head.len() - tail_part.len(),
+        tail_part
+    )
+}
+
+/// 手写 base64（RFC 4648 标准字母表，带 padding）。不引入新依赖：
+/// 分块大小是 3 的倍数时各块独立编码可拼接解码（LARGE_OUTPUT_CHUNK_BYTES 已保证）。
+fn b64_encode(data: &[u8]) -> String {
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TBL[(n >> 18) as usize & 63] as char);
+        out.push(TBL[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TBL[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TBL[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// bash 工具声明（ToolDecl JSON）。`workdir` 写进描述，与 exec 的 cd 前缀一致，
 /// 避免"工具描述说 /app、实际在 /testbed"的目录矛盾（S0 零补丁缺陷嫌疑之一）。
 /// fix2：描述补防错条款（mcode 式"把失败模式写进描述"）——新 shell 语义、
@@ -345,6 +477,65 @@ pub fn bash_tool_decl(workdir: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- fix4-align2-tier0（第 0 档 S083）大输出外置 ----
+
+    #[test]
+    fn b64_encode_matches_known_vectors() {
+        assert_eq!(b64_encode(b""), "");
+        assert_eq!(b64_encode(b"f"), "Zg==");
+        assert_eq!(b64_encode(b"fo"), "Zm8=");
+        assert_eq!(b64_encode(b"foo"), "Zm9v");
+        assert_eq!(b64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(b64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(b64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn b64_chunked_encoding_is_concatenable() {
+        // 分块（3 的倍数）独立编码 = 整体编码：externalize_output 的分块写回依赖此性质。
+        let data: Vec<u8> = (0..=255u8).cycle().take(72_000 * 2 + 3).collect();
+        let whole = b64_encode(&data);
+        let chunked: String = data
+            .chunks(LARGE_OUTPUT_CHUNK_BYTES)
+            .map(b64_encode)
+            .collect();
+        assert_eq!(whole, chunked);
+    }
+
+    #[test]
+    fn large_output_preview_keeps_head_tail_and_exit_line() {
+        let mut full = "HEAD".repeat(600); // 2400 B > 预览头 2000
+        full.push('\n');
+        full.push_str(&"m".repeat(20_000)); // 中段必然被省略
+        full.push_str("\nexit=0");
+        let preview = large_output_preview(&full, "/tmp/.af-outputs/x-1-0.txt");
+        assert!(preview.starts_with(&safe_prefix(&full, LARGE_OUTPUT_PREVIEW_HEAD)));
+        assert!(preview.contains("/tmp/.af-outputs/x-1-0.txt"));
+        assert!(preview.contains(&format!("{}-byte output", full.len()))); // 全量字节数如实
+        assert!(preview.ends_with("\nexit=0")); // rc 解析锚点在末行
+        assert!(preview.len() < full.len());
+    }
+
+    #[test]
+    fn safe_slices_respect_char_boundaries() {
+        // 多字节字符（3 字节 '中'）跨界时不 panic 且不产生无效 UTF-8。
+        let text = "中".repeat(10_000); // 30_000 B
+        let p = safe_prefix(&text, 12_345);
+        assert!(p.len() <= 12_345);
+        let s = safe_suffix(&text, 7_777);
+        assert!(s.len() <= 7_777);
+        assert!(text.ends_with(s) && text.starts_with(p));
+    }
+
+    #[test]
+    fn lossy_truncate_reports_elided_bytes() {
+        let text = format!("{}\nexit=1", "x".repeat(30_000));
+        let out = lossy_truncate(&text, 12_000);
+        assert!(out.contains("bytes elided"));
+        assert!(out.ends_with("\nexit=1"));
+        assert!(out.len() < text.len());
+    }
 
     /// 资源护栏常量必须与运营者校准口径一致（agent 6g/512、判分 4g/256、TB 2g/256）：
     /// 防后人误改把护栏改没或改歪（2026-10-21 anolis 无上限容器耗尽事故的固化）。
