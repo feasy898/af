@@ -823,6 +823,93 @@ fn wall_timeout_stops_before_another_model_call_and_warns_once() {
 }
 
 #[test]
+fn wall_patch_first_off_matches_v8_byte_for_byte_and_on_adds_exactly_two_clauses() {
+    // C2（对齐组第三循环候选①位）去重合成的逐字节锚定：
+    // · OFF 臂（缺省）gentle/strong 与 v8 文案逐字节一致，两点增量片段零出现；
+    // · ON 臂 = OFF 文案 + 恰好两点增量（「尚无修复先落盘」+「转 verification-only」），
+    //   「提交现在最优修复」「不再开新线」等既有语义零改动——同二进制 A/B 只差该条款。
+    let run_arm = |patch_first: bool| {
+        let fix = Fixture::new();
+        let stub = StubServer::spawn().unwrap();
+        let mut spec = spec_at(&stub.url());
+        spec.policy.max_turns = 8;
+        spec.policy.wall_timeout_secs = Some(300);
+        spec.policy.wall_patch_first = patch_first;
+        spec.policy.stop.completion_signals.clear();
+        spec.policy.stop.tool_free_turn_limit = 8;
+        for args in ["git status", "git diff", "git log"] {
+            stub.push(StubResponse::json(
+                200,
+                assistant_calls("", &[("git", json!({"args": args}))]),
+            ));
+        }
+        let clock = fix.clock.clone();
+        let mut tools = ToolRegistry::new();
+        tools.register("git", move |_args| {
+            clock.advance(100_000);
+            Ok(json!({"ok": true}))
+        });
+        let opened = Opened::open_with_clock(&fix.dir, fix.clock.clone()).unwrap();
+        opened.run(fix.launch(spec, tools)).unwrap()
+    };
+    let extract = |report: &crate::run::RunReport, prefix: &str| -> String {
+        report
+            .transcript
+            .iter()
+            .find_map(|item| match item {
+                TranscriptItem::User { text } if text.starts_with(prefix) => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let off = run_arm(false);
+    let on = run_arm(true);
+    let off_gentle = extract(&off, "[Harness feedback] Time budget:");
+    let off_strong = extract(&off, "[Harness feedback] FINAL time warning:");
+    let on_gentle = extract(&on, "[Harness feedback] Time budget:");
+    let on_strong = extract(&on, "[Harness feedback] FINAL time warning:");
+
+    // OFF = v8 文案逐字节（守卫：改动 OFF 文案必须显式换代，不许静默漂移）。
+    assert_eq!(
+        off_strong,
+        "[Harness feedback] FINAL time warning: about 2 minutes remain before this run is force-stopped by the wall-clock budget. Submit your best current fix NOW (print the completion token via a command) — no further turns will run after the deadline."
+    );
+    assert_eq!(
+        off_gentle,
+        "[Harness feedback] Time budget: about 5 minutes remain before the wall-clock budget force-stops this run. If your fix is already verified, submit now (print the completion token via a command). Do not start new lines of work."
+    );
+    for t in [&off_gentle, &off_strong] {
+        assert!(!t.contains("partial fix"), "{t}");
+        assert!(!t.contains("verification-only"), "{t}");
+    }
+
+    // ON = OFF + 恰好两点增量，其余逐字节不变。
+    assert_eq!(
+        on_strong,
+        off_strong.replace(
+            "Submit your best current fix NOW",
+            "If the working tree does not contain your fix yet, first write your best current partial fix into the repository source files, then submit NOW",
+        )
+    );
+    assert_eq!(
+        on_gentle,
+        off_gentle.replace(
+            "Do not start new lines of work.",
+            "If the working tree does not contain your fix yet, write your best current partial fix into the repository source files now and switch to verification-only mode (only run checks that validate what you already changed — no new investigation). Do not start new lines of work.",
+        )
+    );
+    // 增量在 ON 臂全程恰好出现两次（gentle + strong 各一次）。
+    let hits = on
+        .transcript
+        .iter()
+        .filter(
+            |item| matches!(item, TranscriptItem::User { text } if text.contains("partial fix")),
+        )
+        .count();
+    assert_eq!(hits, 2, "gentle/strong 各一次，不应多发");
+}
+
+#[test]
 fn wall_timeout_absent_by_default_keeps_legacy_behavior() {
     // 历史规格（不带 wall_timeout_secs）行为不变：跑满 max_turns 收束。
     let fix = Fixture::new();

@@ -326,9 +326,21 @@ const WALL_STRONG_PREFIX: &str = "[Harness feedback] FINAL time warning:";
 const WALL_GENTLE_REMAINING_SECS: u64 = 300;
 const WALL_STRONG_REMAINING_SECS: u64 = 120;
 
+/// C2「墙钟压力下补丁先行」两点增量（对齐组第三循环候选①位，红队 32968
+/// issue ③ 的去重合成前置）：既有收尾文案已覆盖「提交现在最优修复」「不再开
+/// 新调查线」「空 diff 即败」，本机制**只**新增两点——①尚无修复时先把最优
+/// 部分修复写进仓库源文件（被判定的就是工作树 diff，落盘才有产物可判）；
+/// ②随后转 verification-only 模式（只跑校验、不再开新工作）。增量只进
+/// user_message 侧（提醒消息/协议条款），system 模板一行不动。
+const WALL_PATCH_FIRST_STRONG: &str = "If the working tree does not contain your fix yet, first write your best current partial fix into the repository source files, then submit NOW";
+const WALL_PATCH_FIRST_GENTLE: &str = "If the working tree does not contain your fix yet, write your best current partial fix into the repository source files now and switch to verification-only mode (only run checks that validate what you already changed — no new investigation).";
+
 /// fix4 墙钟收尾机制（fix2 轮次收尾的墙钟版）：预算可见性——模型按可知的
 /// 死线规划提交，而不是被硬切在半路。以 transcript 前缀判重，恰好一次。
-fn push_wall_budget_reminders(live: &mut Live, now_ms: u64, deadline_ms: u64) {
+/// `patch_first` 为 C2 旋钮（`Policy::wall_patch_first`）：true 时 gentle/strong
+/// 文案按旗标换成带两点增量的常量；false 时与 v8 文案逐字节一致（tests.rs
+/// 逐字节锚定测试钉死）。
+fn push_wall_budget_reminders(live: &mut Live, now_ms: u64, deadline_ms: u64, patch_first: bool) {
     let remaining_secs = deadline_ms.saturating_sub(now_ms) / 1_000;
     let has_marker = |live: &Live, prefix: &str| {
         live.transcript
@@ -337,20 +349,30 @@ fn push_wall_budget_reminders(live: &mut Live, now_ms: u64, deadline_ms: u64) {
     };
     if remaining_secs <= WALL_STRONG_REMAINING_SECS {
         if !has_marker(live, WALL_STRONG_PREFIX) {
-            live.transcript.push(TranscriptItem::User {
-                text: format!(
+            let strong = if patch_first {
+                format!(
+                    "{WALL_STRONG_PREFIX} about 2 minutes remain before this run is force-stopped by the wall-clock budget. {WALL_PATCH_FIRST_STRONG} (print the completion token via a command) — no further turns will run after the deadline."
+                )
+            } else {
+                format!(
                     "{WALL_STRONG_PREFIX} about 2 minutes remain before this run is force-stopped by the wall-clock budget. Submit your best current fix NOW (print the completion token via a command) — no further turns will run after the deadline."
-                ),
-            });
+                )
+            };
+            live.transcript.push(TranscriptItem::User { text: strong });
         }
         return;
     }
     if remaining_secs <= WALL_GENTLE_REMAINING_SECS && !has_marker(live, WALL_GENTLE_PREFIX) {
-        live.transcript.push(TranscriptItem::User {
-            text: format!(
+        let gentle = if patch_first {
+            format!(
+                "{WALL_GENTLE_PREFIX} about 5 minutes remain before the wall-clock budget force-stops this run. If your fix is already verified, submit now (print the completion token via a command). {WALL_PATCH_FIRST_GENTLE} Do not start new lines of work."
+            )
+        } else {
+            format!(
                 "{WALL_GENTLE_PREFIX} about 5 minutes remain before the wall-clock budget force-stops this run. If your fix is already verified, submit now (print the completion token via a command). Do not start new lines of work."
-            ),
-        });
+            )
+        };
+        live.transcript.push(TranscriptItem::User { text: gentle });
     }
 }
 
@@ -547,8 +569,14 @@ impl Opened {
             });
         }
         // fix4 墙钟收尾：剩 5 分钟 gentle、剩 2 分钟 strong，各恰好一次。
+        // C2 旋钮随 Policy 穿线：true 时两条文案带「落盘 + verification-only」增量。
         if let Some(deadline) = wall_deadline_ms {
-            push_wall_budget_reminders(live, self.clock.wall_ms(), deadline);
+            push_wall_budget_reminders(
+                live,
+                self.clock.wall_ms(),
+                deadline,
+                launch.spec.policy.wall_patch_first,
+            );
         }
         let system = render(&launch.spec.context_template, &launch.vars)?;
         let mut request = Vec::with_capacity(live.transcript.len() + 1);

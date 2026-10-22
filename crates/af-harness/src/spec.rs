@@ -148,6 +148,14 @@ pub struct Policy {
     /// None = 不限墙钟（缺省，历史规格原样可读）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_timeout_secs: Option<u64>,
+    /// C2「墙钟压力下补丁先行」旋钮（对齐组第三循环候选①位，同二进制 A/B 的
+    /// on/off）。true 时墙钟收尾提醒与 instance 协议硬墙钟条款带两点增量
+    /// （「尚无修复先落盘」+「转 verification-only」，与既有收尾文案去重合成，
+    /// 红队 32968 issue ③）；false（缺省）= 文案与 v8 逐字节一致。只改
+    /// user_message 侧提示词，system 模板与判分路径零接触；墙钟值不动。
+    /// false 不序列化：OFF 臂 spec_json 与 v8 同形。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wall_patch_first: bool,
     pub stop: StopCondition,
     pub budget_ref: BudgetRef,
 }
@@ -399,5 +407,23 @@ mod tests {
 
         spec.policy.wall_timeout_secs = Some(0);
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn wall_patch_first_defaults_false_and_serializes_only_when_true() {
+        // C2 旋钮：缺省（历史规格）false 且编码不写出该字段——OFF 臂 spec_json
+        // 与 v8 同形；true 时字段在场且可回读（同二进制 A/B 行级可辨）。
+        let base = decode_spec(crate::EXAMPLE_SPEC_JSON).unwrap();
+        assert!(!base.policy.wall_patch_first);
+        let encoded = encode_spec(&base).unwrap();
+        assert!(!encoded.contains("wall_patch_first"), "{encoded}");
+
+        let mut spec = decode_spec(crate::EXAMPLE_SPEC_JSON).unwrap();
+        spec.policy.wall_patch_first = true;
+        let again = decode_spec(&encode_spec(&spec).unwrap()).unwrap();
+        assert_eq!(again, spec);
+        assert!(encode_spec(&spec)
+            .unwrap()
+            .contains(r#""wall_patch_first": true"#));
     }
 }

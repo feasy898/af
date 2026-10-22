@@ -82,6 +82,7 @@ fn smoke() -> Result<(), Box<dyn std::error::Error>> {
         policy: Policy {
             max_turns: 1,
             wall_timeout_secs: None,
+            wall_patch_first: false,
             stop: StopCondition {
                 completion_signals: Vec::new(),
                 tool_free_turn_limit: 8,

@@ -73,6 +73,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn swev_protocol_knob_selects_constants_and_off_is_byte_identical() {
+        // C2（对齐组第三循环候选①位）：OFF = v8 协议逐字节；ON = 仅硬墙钟条款
+        // 织入两点增量（其余文案单一来源、由替换生成防漂移）。拼装点按旗标选
+        // 常量（B2 §四形态），只改 user_message 侧，system 保持一行。
+        // 锚句在场守卫：基协议必须包含 OFF 条款，否则替换会静默空转。
+        assert!(SWEV_INSTANCE_PROTOCOL.contains(SWEV_WALL_CLAUSE_OFF));
+        let off = swev_protocol(false);
+        let on = swev_protocol(true);
+        assert_eq!(off, SWEV_INSTANCE_PROTOCOL);
+        assert!(on.contains(SWEV_WALL_CLAUSE_ON));
+        assert!(!on.contains(SWEV_WALL_CLAUSE_OFF));
+        // 两点增量各恰好一次；除该条款外与 OFF 逐字节一致。
+        assert_eq!(on.matches("partial fix").count(), 1);
+        assert_eq!(on.matches("verification-only").count(), 1);
+        assert_eq!(on.replace(SWEV_WALL_CLAUSE_ON, SWEV_WALL_CLAUSE_OFF), off);
+    }
+
     // ---- fix4-align-r2：bash 结果通道判别 ----
 
     #[test]
@@ -158,6 +176,11 @@ struct Args {
     judge_mode: String,
     /// POC-1：swev-rejudge 的存量 run 根目录。
     from: PathBuf,
+    /// C2「墙钟压力下补丁先行」旋钮（对齐组第三循环候选①位）：true = 墙钟收尾
+    /// 提醒与 instance 协议带「尚无修复先落盘 + 转 verification-only」两点增量。
+    /// 缺省 false = 文案与 v8 逐字节一致（同二进制 A/B 的 OFF 臂）。只作用于
+    /// swe-v；TB/InjecAgent 口径不动；墙钟值 1800s 不动；判分路径零接触。
+    wall_patch_first: bool,
 }
 
 impl Args {
@@ -174,6 +197,7 @@ impl Args {
         let mut host = "anolis".to_string();
         let mut judge_mode = "clean".to_string();
         let mut from = PathBuf::new();
+        let mut wall_patch_first = false;
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -211,6 +235,7 @@ impl Args {
                 "--host" => host = it.next().ok_or("--host 缺值")?,
                 "--judge-mode" => judge_mode = it.next().ok_or("--judge-mode 缺值")?,
                 "--from" => from = PathBuf::from(it.next().ok_or("--from 缺值")?),
+                "--wall-patch-first" => wall_patch_first = true,
                 other => return Err(format!("未知参数 {other}")),
             }
         }
@@ -228,6 +253,7 @@ impl Args {
             host,
             judge_mode,
             from,
+            wall_patch_first,
         })
     }
 }
@@ -747,6 +773,25 @@ When your fix is verified:
 2. Submit: run a bash command that PRINTS the token TASK_COMPLETE as its FIRST output line, e.g. `echo TASK_COMPLETE`.
 Mentioning TASK_COMPLETE in plain text does NOT finish the run — only the printed output of an executed command does. After the token prints, the run ends immediately and you cannot continue working."#;
 
+/// C2（对齐组第三循环候选①位）硬墙钟条款的 OFF/ON 两常量：ON 只在 OFF 句里
+/// 织入两点增量——「尚无修复先落盘」+「转 verification-only」（红队 32968
+/// issue ③：与既有三条收尾文案去重合成，不重复「立即提交」「空 diff 即败」
+/// 等既有语义）。`SWEV_INSTANCE_PROTOCOL` 必须包含 OFF 句（测试钉死），
+/// ON 版由替换生成，防两份长文案漂移。
+const SWEV_WALL_CLAUSE_OFF: &str = "When the harness tells you little time remains, submit immediately with your best current fix — the run is killed at the deadline with whatever is on disk.";
+const SWEV_WALL_CLAUSE_ON: &str = "When the harness tells you little time remains, submit immediately with your best current fix — if the working tree does not contain a fix yet, first write your best partial fix into the repository source files and switch to verification-only mode (no new investigation), then submit. The run is killed at the deadline with whatever is on disk.";
+
+/// 按旋钮选协议常量（B2 §四形态：拼装点按旗标选常量，只改 user_message 侧，
+/// system 保持一行）。ON 版进程内只生成一次。
+fn swev_protocol(patch_first: bool) -> &'static str {
+    static ON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if patch_first {
+        ON.get_or_init(|| SWEV_INSTANCE_PROTOCOL.replace(SWEV_WALL_CLAUSE_OFF, SWEV_WALL_CLAUSE_ON))
+    } else {
+        SWEV_INSTANCE_PROTOCOL
+    }
+}
+
 /// fix2 反考古护栏的触发模式（失败轨迹分析 §1.3 D-考古：51/145 run、单例烧 10-20 轮）。
 /// 取证据里最明确的全库考古/全盘搜索形态，避免误伤正常源码搜索。
 const ARCHAEOLOGY_PATTERNS: &[&str] = &[
@@ -960,7 +1005,10 @@ fn run_swev(args: &Args) -> Result<(), String> {
                     // 预算却把成批 run 硬切在半路（fix1 代际 76/132 终态 max_turns，
                     // 墙钟中位 1112s/992s 远未到 1800s，瓶颈是调用次数而非时间）。
                     // 时间成为约束后与商业线同口径：同样 30 分钟，够就走完全流程。
+                    // C2 红线：墙钟值 1800s 不动——A/B 两臂唯一差 = 提示词条款旋钮。
                     wall_timeout_secs: Some(1_800),
+                    // C2「墙钟压力下补丁先行」on/off（--wall-patch-first）。
+                    wall_patch_first: args.wall_patch_first,
                     stop: StopCondition {
                         completion_signals: vec!["TASK_COMPLETE".into()],
                         tool_free_turn_limit: 3,
@@ -987,7 +1035,13 @@ fn run_swev(args: &Args) -> Result<(), String> {
                 Some(std::sync::Arc::new(move || resolve_key(key_cmd)));
             let opened = Opened::open(&attempt_dir).map_err(|err| format!("open run: {err}"))?;
             // fix2：纪律随任务重发（instance 模板），attempt 恒 1（无 gate 重试）。
-            let user_message = format!("{}\n\n{}", task.prompt(), SWEV_INSTANCE_PROTOCOL);
+            // C2 on/off 旋钮（同二进制 A/B）：OFF = v8 协议逐字节不变；
+            // ON = 硬墙钟条款带两点增量。只改 user_message 侧。
+            let user_message = format!(
+                "{}\n\n{}",
+                task.prompt(),
+                swev_protocol(args.wall_patch_first)
+            );
             match opened.run(Launch {
                 spec,
                 run_id: format!("{}-a{}", task.instance_id, attempt),
@@ -1048,9 +1102,11 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         "trial": args.trial,
                         "reward": Value::Null,
                         "status": "run_failed",
-                        // fix4-align2-tier0：scaffold v8 = v7 − S002/S118 观测折叠
-                        // （回归回退，见下方结果行注释）；v7 = v6 + S083 外置。
-                        "scaffold": "v8",
+                        // fix4-align4-p0：scaffold v9 = v8 + C2 墙钟收尾行为纪律
+                        // （--wall-patch-first 旋钮，两点增量文案；见下方结果行注释）。
+                        "scaffold": "v9",
+                        // C2 旋钮自述：A/B 两臂行级可辨（OFF=false 与 v8 行为逐字节一致）。
+                        "wall_patch_first": args.wall_patch_first,
                         // S151 溯源：run_failed 行同样锚定产出提交。
                         "harness_commit": harness_commit(),
                         // D-20 项 1：run_failed 行也记实际目录（trail 留在现场供复核）。
@@ -1099,7 +1155,14 @@ fn run_swev(args: &Args) -> Result<(), String> {
             "trial": args.trial,
             "reward": resolved,
             "status": status_label(&report.status),
-            // fix4-align2-tier0：scaffold v8 = v7 − S002/S118 观测折叠（回归回退）。
+            // fix4-align4-p0：scaffold v9 = v8 + C2「墙钟压力下补丁先行」（对齐组
+            // 第三循环候选①位）——--wall-patch-first 旋钮（缺省关），ON 时墙钟
+            // 收尾提醒（gentle/strong）与 instance 协议硬墙钟条款带两点增量：
+            // 「尚无修复先把最优部分修复落盘」+「转 verification-only 模式」，
+            // 与既有三条收尾文案去重合成（红队 32968 issue ③）；OFF 臂文案与
+            // v8 逐字节一致（tests 逐字节锚定）。scaffold bump 只作结果行锚定，
+            // 不得代替同二进制 A/B 配对（对齐组-state §27.3 共同条）。
+            // v8 = v7 − S002/S118 观测折叠（回归回退，机制留档 commit 9818633）。
             // 回退依据：tier0 采纳轮 5 题回归门禁 2/5（门禁要求全过），其中
             // xarray-4094 在 v6 对照臂 resolved=true 而 v7 resolved=false——
             // 采纳面（折叠/外置）致归成立；折叠（keep-last-5）为首要嫌疑，
@@ -1121,7 +1184,9 @@ fn run_swev(args: &Args) -> Result<(), String> {
             // v3 原文：提交式完成协议 + instance 纪律 + 250 步/$3/温度0/top_p1/
             // max_tokens 32000 + 无 gate 重试。reasoning 档位按审计 §6.A.7 显式声明
             // （保持 Off = mini 默认不发 thinking）。
-            "scaffold": "v8",
+            "scaffold": "v9",
+            // C2 旋钮自述：A/B 两臂行级可辨（OFF=false 与 v8 行为逐字节一致）。
+            "wall_patch_first": args.wall_patch_first,
             // S151 溯源：本结果行产自哪个 harness 提交（与 scaffold 双锚定）。
             "harness_commit": harness_commit(),
             "reasoning_tier": "off",
@@ -1370,6 +1435,8 @@ fn run_tb(args: &Args) -> Result<(), String> {
                 max_turns: 40,
                 // fix4：墙钟预算只上 swe-v 线（证据都在那条线）；TB 口径不动。
                 wall_timeout_secs: None,
+                // C2 只上 swe-v 线；TB 口径不动。
+                wall_patch_first: false,
                 stop: StopCondition {
                     completion_signals: vec!["TASK_COMPLETE".into()],
                     tool_free_turn_limit: 3,
@@ -1546,6 +1613,8 @@ fn run_injec(args: &Args) -> Result<(), String> {
                 max_turns: 16,
                 // fix4：墙钟预算只上 swe-v 线；InjecAgent 口径不动。
                 wall_timeout_secs: None,
+                // C2 只上 swe-v 线；InjecAgent 口径不动。
+                wall_patch_first: false,
                 stop: StopCondition {
                     completion_signals: Vec::new(),
                     tool_free_turn_limit: 1,
