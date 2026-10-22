@@ -367,51 +367,6 @@ fn call_fingerprint(args: &Value) -> Option<String> {
     Some(format!("fnv1a64:{hash:016x}:{}", text.len()))
 }
 
-/// fix4-align2-tier0（第 0 档 S002+S118）观测折叠：把除最近 `keep_last` 条之外的
-/// 工具结果在**请求组装侧**折叠成单行注记（保留调用骨架：call_id/name/is_error 原样，
-/// 只把 output 换成折叠说明）。落库 transcript 不动——审计面完整、续跑重放一致。
-///
-/// 依据：SWE-agent 官方 last-5-observations 窗口（A 级消融，比全量历史 +3.0pp、
-/// Claude 3 Opus 上相对 +50%；丢弃的是过期文件内容，保留计划与动作轨迹）
-/// + Anthropic context editing（超限清旧工具结果，保留调用骨架）。
-///
-/// 两者合并为同一个零 LLM 成本的结构性机制（S009 教训：不上 LLM 摘要压缩器，
-/// 只用一个确定性折叠器；S033 语义下 System/User 项永不折叠，约束钉在窗口外）。
-/// 只统计 Tool 项：折叠边界每轮至多前进一条，已折叠前缀逐字稳定，前缀缓存友好。
-pub fn fold_observations(transcript: &[TranscriptItem], keep_last: usize) -> Vec<TranscriptItem> {
-    let tool_positions: Vec<usize> = transcript
-        .iter()
-        .enumerate()
-        .filter_map(|(i, item)| matches!(item, TranscriptItem::Tool { .. }).then_some(i))
-        .collect();
-    if keep_last == 0 || tool_positions.len() <= keep_last {
-        return transcript.to_vec();
-    }
-    let fold_count = tool_positions.len() - keep_last;
-    let mut out = transcript.to_vec();
-    for &pos in &tool_positions[..fold_count] {
-        if let TranscriptItem::Tool {
-            call_id,
-            name,
-            output,
-            is_error,
-        } = &transcript[pos]
-        {
-            let bytes = serde_json::to_string(output).map(|s| s.len()).unwrap_or(0);
-            out[pos] = TranscriptItem::Tool {
-                call_id: call_id.clone(),
-                name: name.clone(),
-                output: Value::String(format!(
-                    "[harness] This earlier tool result was folded (context policy: only the last {keep_last} tool results are kept in full). It was the `{name}` tool; the original output was {bytes} bytes and it {} an error. Re-run a narrowed version of that command if you need this content again.",
-                    if *is_error { "reported" } else { "was not" }
-                )),
-                is_error: *is_error,
-            };
-        }
-    }
-    out
-}
-
 enum Dispatch {
     Done(Done),
     Denied(RunStatus),
@@ -598,12 +553,7 @@ impl Opened {
         let system = render(&launch.spec.context_template, &launch.vars)?;
         let mut request = Vec::with_capacity(live.transcript.len() + 1);
         request.push(TranscriptItem::System { text: system });
-        // fix4-align2-tier0（第 0 档 S002+S118）：请求组装侧观测折叠——
-        // 只改发给模型的请求，落库 transcript 原样（审计/续跑不受影响）。
-        request.extend(match launch.spec.policy.observation_window {
-            Some(keep_last) => fold_observations(&live.transcript, keep_last),
-            None => live.transcript.clone(),
-        });
+        request.extend(live.transcript.iter().cloned());
         let tools = visible_tools(&launch.spec, &live.cred.tools);
         let message = match complete_once(
             &self.http,

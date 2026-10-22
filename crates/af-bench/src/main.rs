@@ -961,9 +961,6 @@ fn run_swev(args: &Args) -> Result<(), String> {
                     // 墙钟中位 1112s/992s 远未到 1800s，瓶颈是调用次数而非时间）。
                     // 时间成为约束后与商业线同口径：同样 30 分钟，够就走完全流程。
                     wall_timeout_secs: Some(1_800),
-                    // fix4-align2-tier0（第 0 档 S002+S118）：观测折叠 keep-last-5
-                    // （SWE-agent 官方默认窗口）。只改请求组装，落库 transcript 原样。
-                    observation_window: Some(5),
                     stop: StopCondition {
                         completion_signals: vec!["TASK_COMPLETE".into()],
                         tool_free_turn_limit: 3,
@@ -1051,12 +1048,9 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         "trial": args.trial,
                         "reward": Value::Null,
                         "status": "run_failed",
-                        // fix4-align2-tier0（第 0 档采纳 bump）：scaffold v7 = v6
-                        // + S083 大输出外置 + S002/S118 观测折叠（keep-last-5）；
-                        // v6 = v4 ∪ v5 机制并集（墙钟 1800s + 指纹刹车 + bash
-                        // is_error 负反馈 + 离线三通道 + 空响应护栏），
-                        // 机制清单见下方结果行注释。
-                        "scaffold": "v7",
+                        // fix4-align2-tier0：scaffold v8 = v7 − S002/S118 观测折叠
+                        // （回归回退，见下方结果行注释）；v7 = v6 + S083 外置。
+                        "scaffold": "v8",
                         // S151 溯源：run_failed 行同样锚定产出提交。
                         "harness_commit": harness_commit(),
                         // D-20 项 1：run_failed 行也记实际目录（trail 留在现场供复核）。
@@ -1105,15 +1099,17 @@ fn run_swev(args: &Args) -> Result<(), String> {
             "trial": args.trial,
             "reward": resolved,
             "status": status_label(&report.status),
-            // fix4-align2-tier0（第 0 档采纳 bump）：scaffold v7 = v6
-            // + 来自 tier0（harness策略调研 第 0 档直接采纳清单）：
+            // fix4-align2-tier0：scaffold v8 = v7 − S002/S118 观测折叠（回归回退）。
+            // 回退依据：tier0 采纳轮 5 题回归门禁 2/5（门禁要求全过），其中
+            // xarray-4094 在 v6 对照臂 resolved=true 而 v7 resolved=false——
+            // 采纳面（折叠/外置）致归成立；折叠（keep-last-5）为首要嫌疑，
+            // 按「掉过→回退定位」纪律回退（commit 9818633 的 revert）。
+            // 机制保留在历史 commit 9818633，待专轮调参（窗口大小/触发条件）后重测。
+            // v8 仍含 tier0 的 S083 大工具输出外置（bb018d3）+ S151 harness_commit 溯源。
+            // 来自 tier0：
             //   · S083 大工具输出外置——超 12KiB 的 bash 输出写回容器 /tmp/.af-outputs/
             //     （base64 分块），上下文只进「头 2000B 预览 + 路径 + 分段回读指引」，
             //     写回失败退回有损截断（af-bench/src/tb.rs exec/externalize_output）。
-            //   · S002/S118 观测折叠——每轮请求只保留最近 5 条工具结果全文
-            //     （SWE-agent last-5 observation 窗口），更早的折叠成单行注记
-            //     （保留调用骨架与 call_id；af-harness/src/run.rs fold_observations）。
-            //   两者只影响模型可见上下文（工具侧/请求组装侧），判分链零改动。
             // v6 = v3 + 以下并集——
             // · 来自 v4（fix4-align-r1）：墙钟预算 wall_timeout_secs=1800s 对齐商业线
             //   os_timeout + 剩 300s/120s 收尾提醒 + Event::ToolOk 入参指纹
@@ -1125,7 +1121,7 @@ fn run_swev(args: &Args) -> Result<(), String> {
             // v3 原文：提交式完成协议 + instance 纪律 + 250 步/$3/温度0/top_p1/
             // max_tokens 32000 + 无 gate 重试。reasoning 档位按审计 §6.A.7 显式声明
             // （保持 Off = mini 默认不发 thinking）。
-            "scaffold": "v7",
+            "scaffold": "v8",
             // S151 溯源：本结果行产自哪个 harness 提交（与 scaffold 双锚定）。
             "harness_commit": harness_commit(),
             "reasoning_tier": "off",
@@ -1374,8 +1370,6 @@ fn run_tb(args: &Args) -> Result<(), String> {
                 max_turns: 40,
                 // fix4：墙钟预算只上 swe-v 线（证据都在那条线）；TB 口径不动。
                 wall_timeout_secs: None,
-                // fix4-align2-tier0：观测折叠只上 swe-v 线；TB 口径不动。
-                observation_window: None,
                 stop: StopCondition {
                     completion_signals: vec!["TASK_COMPLETE".into()],
                     tool_free_turn_limit: 3,
@@ -1552,8 +1546,6 @@ fn run_injec(args: &Args) -> Result<(), String> {
                 max_turns: 16,
                 // fix4：墙钟预算只上 swe-v 线；InjecAgent 口径不动。
                 wall_timeout_secs: None,
-                // fix4-align2-tier0：观测折叠只上 swe-v 线；InjecAgent 口径不动。
-                observation_window: None,
                 stop: StopCondition {
                     completion_signals: Vec::new(),
                     tool_free_turn_limit: 1,
