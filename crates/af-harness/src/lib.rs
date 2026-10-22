@@ -41,11 +41,11 @@ pub use endpoint::{
     ANTHROPIC_VERSION,
 };
 pub use error::Error;
-pub use http::{HttpClient, HttpCallMeta, HttpResponse, UreqClient};
+pub use http::{HttpCallMeta, HttpClient, HttpResponse, UreqClient};
 pub use render::render;
 pub use run::{
-    Breakpoint, KeyRefresher, Launch, ObsHook, Opened, RunReport, RunStatus, TokenTotals,
-    ToolFailure, ToolRegistry,
+    Breakpoint, KeyRefresher, Launch, ObsHook, Opened, ProgressRow, RunReport, RunStatus,
+    TokenTotals, ToolFailure, ToolRegistry,
 };
 pub use spec::{
     decode_spec, encode_spec, AgentSpec, AuthStyle, BudgetRef, BudgetUnit, ContextTemplate,

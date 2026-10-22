@@ -251,7 +251,12 @@ impl HttpClient for UreqClient {
                 }
             };
             if !retryable(status) || retries >= self.retry.max_retries {
-                record_meta(Some(status), retries, after.map(|d| d.as_millis() as u64), last_backoff_ms);
+                record_meta(
+                    Some(status),
+                    retries,
+                    after.map(|d| d.as_millis() as u64),
+                    last_backoff_ms,
+                );
                 return Ok(HttpResponse {
                     status,
                     body: redact(&text, secret),

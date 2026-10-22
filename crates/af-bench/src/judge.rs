@@ -111,10 +111,10 @@ pub fn verify_clean(
         sanitize(&task.instance_id),
         uniq_suffix()
     );
-    let _ = docker_quiet(&["rm", "-f", &container]);    // 干净容器：**不注入任何代理环境变量**（这一条就是 POC-1 的全部意义）。
-    // 资源护栏（2026-10-21，常量与校准注释见 tb 模块）：判分容器 4g/256——
-    // 判分跑完整测试套件（pip install . + pytest），给足但封顶；串行判分口径下
-    // 全厂同时只有个位数判分容器，14 臂 agent 6g + 判分 4g 仍在 125G 预算内。
+    let _ = docker_quiet(&["rm", "-f", &container]); // 干净容器：**不注入任何代理环境变量**（这一条就是 POC-1 的全部意义）。
+                                                     // 资源护栏（2026-10-21，常量与校准注释见 tb 模块）：判分容器 4g/256——
+                                                     // 判分跑完整测试套件（pip install . + pytest），给足但封顶；串行判分口径下
+                                                     // 全厂同时只有个位数判分容器，14 臂 agent 6g + 判分 4g 仍在 125G 预算内。
     let started = Command::new("docker")
         .args([
             "run",
@@ -303,11 +303,7 @@ fn judge_in_container(
 /// 官方判分器调用（退避重试：非 0 退出 / 输出非 JSON 都算失败）。
 /// fix4-observability：返回 (JudgeRun 结构化详情, note)。重试耗尽仍失败 → resolved=None
 /// 且 note 带 "JUDGE_ERROR: " 前缀；stderr 保留末 2KB 原文（崩溃栈在尾部，红队③）。
-pub fn run_judge(
-    task_json_path: &Path,
-    log_path: &Path,
-    diff_path: &Path,
-) -> (JudgeRun, String) {
+pub fn run_judge(task_json_path: &Path, log_path: &Path, diff_path: &Path) -> (JudgeRun, String) {
     let mut last_err = String::new();
     let mut last_run = JudgeRun::default();
     for attempt in 1..=JUDGE_MAX_ATTEMPTS {
@@ -360,8 +356,10 @@ pub fn run_judge(
                             run.log_parsed = row.get("log_parsed").and_then(Value::as_bool);
                             run.env_yml_synthesized =
                                 row.get("env_yml_synthesized").and_then(Value::as_bool);
-                            run.swebench_version =
-                                row.get("swebench_version").and_then(Value::as_str).map(str::to_string);
+                            run.swebench_version = row
+                                .get("swebench_version")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
                             let f2p_pass = row.get("f2p_success").and_then(Value::as_u64);
                             let f2p_fail = row.get("f2p_failure").and_then(Value::as_u64);
                             let p2p_pass = row.get("p2p_success").and_then(Value::as_u64);

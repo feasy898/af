@@ -36,6 +36,13 @@ mod obs;
 mod swev;
 mod tb;
 
+/// swe-v 线停止策略成本上限（美分）。终审 O5 / 状态账 L2 同源修复：此前指纹块
+/// （run_started.spend_cap_cents / tool_spend_cents）与执行侧（Launch 字段、
+/// BudgetBinding 账本与上限）各写一份字面量，两处各自演化会让指纹对停止策略
+/// 静默失真（指纹≠执行侧实读值）。收敛为单一常量，指纹块与执行侧同读此处。
+const SWEV_SPEND_CAP_CENTS: i64 = 300;
+const SWEV_TOOL_SPEND_CENTS: i64 = 1;
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("af-bench failed: {err}");
@@ -92,6 +99,10 @@ struct Args {
     judge_mode: String,
     /// POC-1：swev-rejudge 的存量 run 根目录。
     from: PathBuf,
+    /// 硬规则 4 证据更正 CLI：--obs-correct <run 目录|events.jsonl>（终审 O1 落地）。
+    obs_correct: Option<PathBuf>,
+    /// 更正请求文件：--correction-json <req.json>（见 obs::CorrectionRequest）。
+    correction_json: Option<PathBuf>,
 }
 
 impl Args {
@@ -108,6 +119,8 @@ impl Args {
         let mut host = "anolis".to_string();
         let mut judge_mode = "clean".to_string();
         let mut from = PathBuf::new();
+        let mut obs_correct: Option<PathBuf> = None;
+        let mut correction_json: Option<PathBuf> = None;
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -145,12 +158,25 @@ impl Args {
                 "--host" => host = it.next().ok_or("--host 缺值")?,
                 "--judge-mode" => judge_mode = it.next().ok_or("--judge-mode 缺值")?,
                 "--from" => from = PathBuf::from(it.next().ok_or("--from 缺值")?),
+                "--obs-correct" => {
+                    obs_correct = Some(PathBuf::from(it.next().ok_or("--obs-correct 缺值")?))
+                }
+                "--correction-json" => {
+                    correction_json =
+                        Some(PathBuf::from(it.next().ok_or("--correction-json 缺值")?))
+                }
                 other => return Err(format!("未知参数 {other}")),
             }
         }
+        // 证据更正 CLI 不跑套件：--suite/--data-root 缺省由 obs-correct 形态补齐。
+        let suite = match suite {
+            Some(s) => s,
+            None if obs_correct.is_some() => "obs-correct".to_string(),
+            None => return Err("缺 --suite".into()),
+        };
         Ok(Self {
-            suite: suite.ok_or("缺 --suite")?,
-            data_root: data_root.ok_or("缺 --data-root")?,
+            suite,
+            data_root: data_root.unwrap_or_default(),
             // --profile 只有跑批套件需要；swev-rejudge 从 run 目录名里读档案名。
             profile: profile.unwrap_or_default(),
             case_file,
@@ -162,6 +188,8 @@ impl Args {
             host,
             judge_mode,
             from,
+            obs_correct,
+            correction_json,
         })
     }
 }
@@ -645,10 +673,89 @@ fn run() -> Result<(), String> {
         // POC-1：只重判不重跑——遍历存量 run 目录里的 agent.diff + 任务包，
         // 在干净容器里重跑判分链，零 LLM 成本。
         "swev-rejudge" => run_swev_rejudge(&args),
+        // 硬规则 4 证据更正 CLI（终审 O1 落地）：归档原字节 → 改写 run_finished
+        // 派生字段 → 追加 harness.correction 事件。不跑任何套件。
+        "obs-correct" => run_obs_correct(&args),
         other => Err(format!(
-            "未知套件 {other}（可选 injecagent / terminal-bench / swe-v / swev-rejudge）"
+            "未知套件 {other}（可选 injecagent / terminal-bench / swe-v / swev-rejudge / obs-correct）"
         )),
     }
+}
+
+/// 证据更正 CLI（硬规则 4 ①②的事件化入口；③变更日志补记由操作人在流程账完成）。
+///
+/// 用法：
+/// ```text
+/// af-bench --obs-correct <run 目录|events.jsonl> --correction-json <req.json>
+/// ```
+/// req.json 形态（旧值不收，由写侧从当前字节实取）：
+/// ```json
+/// {"corrections":[{"field":"tokens_input","new":50199}],
+///  "reason":"d73338e 实算回填","basis_rev":"d73338e","operator":"…"}
+/// ```
+/// 归档根：`AF_OBS_ARCHIVE_ROOT` 可覆盖（同样受 D-24 内存盘红线），缺省
+/// `<观测根>/../observability-archive`（方案 §3.3 布局）。
+fn run_obs_correct(args: &Args) -> Result<(), String> {
+    let events_path = match &args.obs_correct {
+        Some(p) if p.is_file() => p.clone(),
+        Some(p) if p.join("events.jsonl").is_file() => p.join("events.jsonl"),
+        Some(p) => {
+            return Err(format!(
+                "{} 不是 events.jsonl 文件，也不含 events.jsonl",
+                p.display()
+            ))
+        }
+        None => return Err("--obs-correct 需要一个 run 目录或 events.jsonl 路径".into()),
+    };
+    let req_path = args
+        .correction_json
+        .as_ref()
+        .ok_or("缺 --correction-json <req.json>")?;
+    let req_text = std::fs::read_to_string(req_path)
+        .map_err(|err| format!("读 {} 失败: {err}", req_path.display()))?;
+    let req: obs::CorrectionRequest = serde_json::from_str(&req_text)
+        .map_err(|err| format!("--correction-json 解析失败: {err}"))?;
+    // 归档根随观测根一起受 D-24 红线约束（观测证据绝不落内存盘）。
+    let archive_root = match std::env::var("AF_OBS_ARCHIVE_ROOT") {
+        Ok(raw) => {
+            let path = PathBuf::from(&raw);
+            std::fs::create_dir_all(&path).map_err(|err| format!("建归档根 {raw} 失败: {err}"))?;
+            let real = std::fs::canonicalize(&path)
+                .map_err(|err| format!("realpath {raw} 失败: {err}"))?
+                .to_string_lossy()
+                .to_string();
+            obs::reject_memory_disk(&real)?;
+            path
+        }
+        Err(_) => obs::resolve_root()?
+            .parent()
+            .map(|p| p.join("observability-archive"))
+            .ok_or("观测根无父目录，无法推导归档根（可用 AF_OBS_ARCHIVE_ROOT 显式指定）")?,
+    };
+    let corrections: Vec<obs::FieldCorrection> = req
+        .corrections
+        .into_iter()
+        .map(|c| obs::FieldCorrection {
+            field: c.field,
+            new: c.new,
+        })
+        .collect();
+    let event = obs::append_correction(
+        &events_path,
+        &archive_root,
+        &corrections,
+        &req.reason,
+        &req.basis_rev,
+        &req.operator,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&event).map_err(|err| format!("{err}"))?
+    );
+    eprintln!(
+        "[obs-correction] 原字节已归档、correction 事件已追加；硬规则 4③（变更日志补记）由操作人在流程账完成"
+    );
+    Ok(())
 }
 
 fn run_swev(args: &Args) -> Result<(), String> {
@@ -740,7 +847,8 @@ fn run_swev(args: &Args) -> Result<(), String> {
         let report;
         let run_dir;
         // fix4-observability：run_obs 在 'run 块内构建；成功路径经槽位传出（失败路径就地收尾）。
-        let mut run_obs_slot: Option<obs::RunObs> = None;
+        // CI clippy（unused_assignments）：所有读到该槽的路径都先赋值，故不做 None 预置。
+        let mut run_obs_slot: Option<obs::RunObs>;
         // D-20 项 1：attempt = run 目录序号（重跑递增防覆写，见 next_attempt_index）；
         // gate 反馈重试仍关闭（审计 D5），结果行 attempts 字段恒 1 的口径不变。
         let attempt = next_attempt_index(&runs_root, &task.instance_id, &args.profile);
@@ -830,11 +938,11 @@ fn run_swev(args: &Args) -> Result<(), String> {
             let launch_run_id = format!("{}-a{}", task.instance_id, attempt);
             let obs_init: Result<obs::RunObs, String> = (|| {
                 let fp_image_ref = task.image.clone();
-                let (fp_image_digest, fp_image_digest_source) = obs::image_digest(&args.host, &fp_image_ref)
-                    .map_err(|err| format!("镜像 digest 采集失败: {err}"))?;
-                let fp_task_sha256 = obs::sha256_file(
-                    &args.data_root.join(format!("{}.json", task.instance_id)),
-                )?;
+                let (fp_image_digest, fp_image_digest_source) =
+                    obs::image_digest(&args.host, &fp_image_ref)
+                        .map_err(|err| format!("镜像 digest 采集失败: {err}"))?;
+                let fp_task_sha256 =
+                    obs::sha256_file(&args.data_root.join(format!("{}.json", task.instance_id)))?;
                 let fp_prompt_sha256 = obs::sha256_bytes(user_message.as_bytes());
                 let fp_judge_script_sha256 = obs::sha256_file(Path::new(obs::JUDGE_PY))?;
                 static JUDGE_ENV: std::sync::OnceLock<Result<(String, String), String>> =
@@ -885,8 +993,9 @@ fn run_swev(args: &Args) -> Result<(), String> {
                     "tool_free_turn_limit": spec.policy.stop.tool_free_turn_limit,
                     "completion_signals": spec.policy.stop.completion_signals,
                     "per_turn_budget_cents": spec.policy.budget_ref.per_turn,
-                    "spend_cap_cents": 300,
-                    "tool_spend_cents": 1,
+                    // L2 同源：读上方单一常量，与 Launch/BudgetBinding 同源（终审 O5）。
+                    "spend_cap_cents": SWEV_SPEND_CAP_CENTS,
+                    "tool_spend_cents": SWEV_TOOL_SPEND_CENTS,
                     "scaffold": "v3",
                     "judge_mode_declared": args.judge_mode,
                     "bench_binary_sha256": bench_binary_sha256,
@@ -928,12 +1037,13 @@ fn run_swev(args: &Args) -> Result<(), String> {
                 public_key: &root.keypair.public(),
                 namespace: "bench".into(),
                 // fix2 对齐（审计 §6.A.2）：单题成本上限 $1 → $3。
-                spend_cap_cents: 300,
-                tool_spend_cents: 1,
+                // L2 同源：与指纹块同读上方单一常量（终审 O5）。
+                spend_cap_cents: SWEV_SPEND_CAP_CENTS,
+                tool_spend_cents: SWEV_TOOL_SPEND_CENTS,
                 budget: BudgetBinding::Cents {
                     dimension: "llm.cents".into(),
-                    ledger: BudgetLedger::new(300),
-                    spend_cap_cents: 300,
+                    ledger: BudgetLedger::new(SWEV_SPEND_CAP_CENTS),
+                    spend_cap_cents: SWEV_SPEND_CAP_CENTS,
                 },
                 order: &order,
                 tools: registry,
@@ -987,7 +1097,9 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         });
                         match run_obs.finish("run_failed", &mut run_finished) {
                             Ok(errs) => obs_write_errors += errs,
-                            Err(e) => eprintln!("[obs] 警告：run_failed 收尾落盘失败（测量继续）: {e}"),
+                            Err(e) => {
+                                eprintln!("[obs] 警告：run_failed 收尾落盘失败（测量继续）: {e}")
+                            }
                         }
                         obs_run_ids.push(run_obs.sink.run_id.clone());
                         obs_event_total += run_obs.sink.count();
@@ -1090,7 +1202,9 @@ fn run_swev(args: &Args) -> Result<(), String> {
             }
             obs_run_ids.push(run_obs.sink.run_id.clone());
             obs_event_total += run_obs.sink.count();
-            *obs_status_counts.entry(finished_status.clone()).or_insert(0) += 1;
+            *obs_status_counts
+                .entry(finished_status.clone())
+                .or_insert(0) += 1;
         }
         env_cell.cleanup();
         if resolved == Some(true) {
@@ -1153,8 +1267,13 @@ fn run_swev(args: &Args) -> Result<(), String> {
     // results.jsonl 已写全的批次不得因观测盘问题被记为失败。
     if !obs_run_ids.is_empty() {
         let counts = serde_json::to_value(&obs_status_counts).unwrap_or_else(|_| json!({}));
-        match obs::write_batch_manifest(&obs_root, &batch_id, &obs_run_ids, obs_event_total, &counts)
-        {
+        match obs::write_batch_manifest(
+            &obs_root,
+            &batch_id,
+            &obs_run_ids,
+            obs_event_total,
+            &counts,
+        ) {
             Ok(manifest_path) => println!(
                 "obs: {} runs, {obs_event_total} events, manifest → {}",
                 obs_run_ids.len(),

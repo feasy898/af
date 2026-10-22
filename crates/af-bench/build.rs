@@ -67,22 +67,22 @@ fn watch_git(manifest: &str) {
         return;
     };
     let w = PathBuf::from(w.trim());
-    let w = if w.is_absolute() { w } else {
+    let w = if w.is_absolute() {
+        w
+    } else {
         git_path.parent().unwrap_or(Path::new(".")).join(w)
     };
     emit_watch(&w.join("HEAD"));
     // commondir：工作树共享的主 .git 目录（分支 ref 与 packed-refs 在那里）。
-    let common = std::fs::read_to_string(w.join("commondir"))
-        .ok()
-        .map(|t| {
-            let t = t.trim();
-            let c = PathBuf::from(t);
-            if c.is_absolute() {
-                c
-            } else {
-                w.join(c)
-            }
-        });
+    let common = std::fs::read_to_string(w.join("commondir")).ok().map(|t| {
+        let t = t.trim();
+        let c = PathBuf::from(t);
+        if c.is_absolute() {
+            c
+        } else {
+            w.join(c)
+        }
+    });
     if let Some(c) = common {
         emit_watch(&c.join("packed-refs"));
         if let Some(branch) = head_branch(&w.join("HEAD")) {
@@ -92,7 +92,12 @@ fn watch_git(manifest: &str) {
 }
 
 fn git(manifest: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").arg("-C").arg(manifest).args(args).output().ok()?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(manifest)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
