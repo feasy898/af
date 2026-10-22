@@ -911,7 +911,9 @@ fn fold_observations_keeps_last_n_and_preserves_call_skeleton() {
         TranscriptItem::System {
             text: "sys-pinned".into(),
         },
-        TranscriptItem::User { text: "task".into() },
+        TranscriptItem::User {
+            text: "task".into(),
+        },
         tool("a", false, "old output A"),
         TranscriptItem::Assistant {
             text: "mid".into(),
@@ -932,8 +934,17 @@ fn fold_observations_keeps_last_n_and_preserves_call_skeleton() {
     assert!(matches!(&folded[1], TranscriptItem::User { .. }));
     assert!(matches!(&folded[3], TranscriptItem::Assistant { .. }));
     // 最旧两条 Tool 折叠：骨架（call_id/name/is_error）原样，output 变单行注记。
-    for (idx, call, err_word) in [(2usize, "call_a", "was not"), (4usize, "call_b", "reported")] {
-        let TranscriptItem::Tool { call_id, name, output, is_error } = &folded[idx] else {
+    for (idx, call, err_word) in [
+        (2usize, "call_a", "was not"),
+        (4usize, "call_b", "reported"),
+    ] {
+        let TranscriptItem::Tool {
+            call_id,
+            name,
+            output,
+            is_error,
+        } = &folded[idx]
+        else {
             panic!("expected Tool at {idx}");
         };
         assert_eq!(call_id, call);
