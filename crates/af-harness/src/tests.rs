@@ -728,3 +728,130 @@ fn endpoint_401_without_refresher_fails_unchanged() {
     assert!(!err.to_string().contains("重取"));
     assert_eq!(stub.requests().len(), 1);
 }
+
+// ---- fix4（fix4-align-r1）：墙钟预算 + 逐字重复成功调用刹车 ----
+
+#[test]
+fn wall_timeout_stops_before_another_model_call_and_warns_once() {
+    let fix = Fixture::new();
+    let stub = StubServer::spawn().unwrap();
+    let mut spec = spec_at(&stub.url());
+    spec.policy.max_turns = 8;
+    spec.policy.wall_timeout_secs = Some(300);
+    spec.policy.stop.completion_signals.clear();
+    spec.policy.stop.tool_free_turn_limit = 8;
+    for args in ["git status", "git diff", "git log"] {
+        stub.push(StubResponse::json(
+            200,
+            assistant_calls("", &[("git", json!({"args": args}))]),
+        ));
+    }
+    let clock = fix.clock.clone();
+    let mut tools = ToolRegistry::new();
+    // 每轮工具调用推进墙钟 100s：t=0 → 100 → 200，300s 到限后不再开新轮。
+    // （参数每轮不同：逐字重复会在墙钟到限前先被指纹连击刹车收束，见下条测试。）
+    tools.register("git", move |_args| {
+        clock.advance(100_000);
+        Ok(json!({"ok": true}))
+    });
+    let opened = Opened::open_with_clock(&fix.dir, fix.clock.clone()).unwrap();
+    let report = opened.run(fix.launch(spec, tools)).unwrap();
+    match report.status {
+        RunStatus::WallTimeout { elapsed_secs } => assert_eq!(elapsed_secs, 300),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(report.model_calls, 3);
+    assert_eq!(stub.requests().len(), 3);
+    // 墙钟收尾反馈各恰好一次：剩 300s 进 gentle 带（turn1）、剩 200s 已发不再发（turn2）、
+    // 剩 100s 进 strong 带（turn3）。
+    let gentle = report
+        .transcript
+        .iter()
+        .filter(
+            |item| matches!(item, TranscriptItem::User { text } if text.contains("Time budget:")),
+        )
+        .count();
+    let strong = report
+        .transcript
+        .iter()
+        .filter(|item| {
+            matches!(item, TranscriptItem::User { text } if text.contains("FINAL time warning:"))
+        })
+        .count();
+    assert_eq!(gentle, 1, "gentle 提醒应恰好一次");
+    assert_eq!(strong, 1, "strong 警告应恰好一次");
+}
+
+#[test]
+fn wall_timeout_absent_by_default_keeps_legacy_behavior() {
+    // 历史规格（不带 wall_timeout_secs）行为不变：跑满 max_turns 收束。
+    let fix = Fixture::new();
+    let stub = StubServer::spawn().unwrap();
+    let mut spec = spec_at(&stub.url());
+    spec.policy.max_turns = 1;
+    spec.policy.stop.completion_signals.clear();
+    spec.policy.stop.tool_free_turn_limit = 8;
+    stub.push(StubResponse::json(200, assistant_text("继续")));
+    stub.push(StubResponse::json(200, assistant_text("不应再调")));
+    let opened = Opened::open_with_clock(&fix.dir, fix.clock.clone()).unwrap();
+    let report = opened.run(fix.launch(spec, ToolRegistry::new())).unwrap();
+    assert!(matches!(report.status, RunStatus::MaxTurns));
+    assert_eq!(report.model_calls, 1);
+}
+
+#[test]
+fn repeated_identical_tool_call_stops_the_run_even_when_ok() {
+    // fix4 主场景：bash 类工具恒以 Ok 结算（fix1 代际 9583 条 tool 记录 0 error），
+    // 逐字重复同一调用 3 次必须被指纹连击刹车停住，而不是烧到 max_turns。
+    let fix = Fixture::new();
+    let stub = StubServer::spawn().unwrap();
+    let mut spec = spec_at(&stub.url());
+    spec.policy.max_turns = 6;
+    spec.policy.stop.completion_signals.clear();
+    spec.policy.stop.tool_free_turn_limit = 8;
+    for _ in 0..3 {
+        stub.push(StubResponse::json(
+            200,
+            assistant_calls("", &[("git", json!({"args": "git diff"}))]),
+        ));
+    }
+    let opened = Opened::open_with_clock(&fix.dir, fix.clock.clone()).unwrap();
+    let mut tools = ToolRegistry::new();
+    tools.register("git", |_args| Ok(json!({"ok": true})));
+    let report = opened.run(fix.launch(spec, tools)).unwrap();
+    assert_eq!(report.model_calls, 3);
+    match report.status {
+        RunStatus::Stopped { decision } => {
+            assert_eq!(
+                decision,
+                Decision::Stop {
+                    reason: StopReason::NoInfluence,
+                }
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn varying_tool_calls_are_not_caught_by_the_repeat_brake() {
+    // 参数不同 = 不同指纹：正常探索不受刹车影响，跑满 max_turns 收束。
+    let fix = Fixture::new();
+    let stub = StubServer::spawn().unwrap();
+    let mut spec = spec_at(&stub.url());
+    spec.policy.max_turns = 3;
+    spec.policy.stop.completion_signals.clear();
+    spec.policy.stop.tool_free_turn_limit = 8;
+    for args in ["git status", "git diff", "git log"] {
+        stub.push(StubResponse::json(
+            200,
+            assistant_calls("", &[("git", json!({"args": args}))]),
+        ));
+    }
+    let opened = Opened::open_with_clock(&fix.dir, fix.clock.clone()).unwrap();
+    let mut tools = ToolRegistry::new();
+    tools.register("git", |_args| Ok(json!({"ok": true})));
+    let report = opened.run(fix.launch(spec, tools)).unwrap();
+    assert_eq!(report.model_calls, 3);
+    assert!(matches!(report.status, RunStatus::MaxTurns), "{report:?}");
+}
