@@ -758,6 +758,24 @@ const ARCHAEOLOGY_PATTERNS: &[&str] = &[
     "find / -type",
 ];
 
+/// S151 溯源（fix4-align2-tier0，第 0 档）：结果行附 harness 提交哈希。
+/// 运行时 git rev-parse（工作树内构建的产物能拿到；二进制被挪走时如实记 unknown，
+/// 不 fail）。比较两版结果时以本字段+scaffold 双锚定，杜绝「拿错版本比分数」。
+fn harness_commit() -> &'static str {
+    static COMMIT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    COMMIT.get_or_init(|| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|hash| !hash.is_empty())
+            .unwrap_or_else(|| "unknown".into())
+    })
+}
+
 fn status_label(status: &RunStatus) -> String {
     match status {
         RunStatus::Completed { .. } => "completed".into(),
@@ -1039,6 +1057,8 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         // is_error 负反馈 + 离线三通道 + 空响应护栏），
                         // 机制清单见下方结果行注释。
                         "scaffold": "v7",
+                        // S151 溯源：run_failed 行同样锚定产出提交。
+                        "harness_commit": harness_commit(),
                         // D-20 项 1：run_failed 行也记实际目录（trail 留在现场供复核）。
                         "run_dir": attempt_dir.display().to_string(),
                         "eval_sha256": Value::Null,
@@ -1106,6 +1126,8 @@ fn run_swev(args: &Args) -> Result<(), String> {
             // max_tokens 32000 + 无 gate 重试。reasoning 档位按审计 §6.A.7 显式声明
             // （保持 Off = mini 默认不发 thinking）。
             "scaffold": "v7",
+            // S151 溯源：本结果行产自哪个 harness 提交（与 scaffold 双锚定）。
+            "harness_commit": harness_commit(),
             "reasoning_tier": "off",
             // D-20 项 1：实际 run 目录（重跑按序号递增，不再同名覆写）。
             "run_dir": run_dir.display().to_string(),
@@ -1253,6 +1275,8 @@ fn run_swev_rejudge(args: &Args) -> Result<(), String> {
             "suite": "swev-rejudge",
             "task_id": task_id,
             "profile": profile,
+            // S151 溯源：执行本次重判的 harness 提交。
+            "harness_commit": harness_commit(),
             "reward": verdict.resolved,
             "status": match verdict.resolved {
                 Some(true) => "resolved",
@@ -1447,6 +1471,8 @@ fn run_tb(args: &Args) -> Result<(), String> {
             "task_id": task.task_id,
             "profile": args.profile,
             "trial": args.trial,
+            // S151 溯源：本结果行产自哪个 harness 提交。
+            "harness_commit": harness_commit(),
             "reward": reward,
             "status": status_label(&report.status),
             "http_retries": opened.http_retries(),
@@ -1593,6 +1619,8 @@ fn run_injec(args: &Args) -> Result<(), String> {
             "case_id": task.case_id,
             "profile": args.profile,
             "trial": args.trial,
+            // S151 溯源：本结果行产自哪个 harness 提交。
+            "harness_commit": harness_commit(),
             "attack_type": task.attack_type,
             "injection_success": outcome.injection_success,
             "user_tool_called": outcome.user_tool_called,
