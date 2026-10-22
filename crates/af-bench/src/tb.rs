@@ -67,6 +67,16 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
+/// bash 工具命令的容器内桥接脚本（`docker exec … bash -lc <这段>` 的实参）。
+/// v6-p01：前缀 `set -o pipefail; `——管道返回值改取最右非零段，令 `__AF_RC=$?`
+/// （→ 输出末行 `exit=N` → `bash_result` 的 is_error 判别）反映真实失败。
+/// 不加 errexit（不提前中断顺序命令）、不动 `cd {workdir} &&` 前缀与分号串联语义；
+/// 非管道命令的 rc 完全不变。前缀写在 profile 脚本之后（-l 已先于 -c 串执行），
+/// 容器内 profile 无法重置它。
+fn bridge_inner(workdir: &str, command: &str) -> String {
+    format!("set -o pipefail; cd {} && {}", workdir, command)
+}
+
 /// 从命令输出末尾剥离 `__AF_RC=<n>` 标记行，返回 (正文, 退出码)。
 /// 标记行缺失 = 外层 timeout 杀掉了整个桥接（含 echo），调用方按超时处理。
 /// 只删标记行本身，其后内容（stderr 合并流）原样保留。
@@ -193,12 +203,20 @@ impl TbEnv {
     /// 改不动的是"被杀"这件事本身，所以恢复文案里**不再教**模型用 `timeout <secs>`
     /// 包长任务（任何 secs>180 的写法都会被 harness 自己的硬上限砍掉，教了就是骗模型）：
     /// 改成教"重定向到文件再分段读"，并把 180s/600s 两个真实数字写进文案。
+    ///
+    /// v6-p01（对齐组候选③ exit 语义修正）：桥接内层加 `set -o pipefail`——
+    /// 此前 `python -m pytest … 2>&1 | tail -20` 这类管道用法即便首段真实失败，
+    /// `__AF_RC=$?` 也只取末端 tail 的 0，exit=N 谎报成功（fix1 代际实测：失败侧
+    /// 23 run 的 1819 条命令里网络探测 76 次、29 次体含 ConnectTimeout 却 exit=0；
+    /// 机制证据见 main.rs bash_result 注释块）。pipefail 只改「管道返回值=最右非零」，
+    /// 非管道命令 rc 不变、无 errexit 不提前中断——纯反馈面，零新增刹车
+    /// （is_error 通道与止损阈值维持 v5 语义，本改动只是让进入通道的 rc 属实）。
     pub fn exec(&self, command: &str, timeout_sec: u32) -> String {
         let timeout_sec = timeout_sec.clamp(1, MAX_BASH_TIMEOUT_SEC);
         let script = format!(
             "docker exec {} bash -lc {}; echo __AF_RC=$?",
             self.container,
-            shell_quote(&format!("cd {} && {}", self.workdir, command))
+            shell_quote(&bridge_inner(&self.workdir, command))
         );
         let (mut text, rc) = match ssh(&self.host, &script, timeout_sec) {
             Ok((_, raw)) => split_rc(&raw),
@@ -357,5 +375,42 @@ mod tests {
         assert_eq!(SWEV_EVAL_CONTAINER_PIDS, "256");
         assert_eq!(TB_CONTAINER_MEM, "2g");
         assert_eq!(TB_CONTAINER_PIDS, "256");
+    }
+
+    /// v6-p01：桥接脚本必须带 pipefail 前缀且原命令原样保留（候选③ 的构造合同）。
+    #[test]
+    fn bridge_inner_prefixes_pipefail_and_keeps_command() {
+        let s = bridge_inner("/testbed", "python -m pytest 2>&1 | tail -20");
+        assert_eq!(
+            s,
+            "set -o pipefail; cd /testbed && python -m pytest 2>&1 | tail -20"
+        );
+        let plain = bridge_inner("/app", "echo TASK_COMPLETE");
+        assert!(plain.starts_with("set -o pipefail; cd /app && echo TASK_COMPLETE"));
+    }
+
+    /// v6-p01 语义合同（真 bash 实证，防回归）：pipefail 下管道取真实失败码；
+    /// 同一管道无 pipefail 时被末端 0 掩蔽（= 修正前的旧行为）；非管道命令与
+    /// 分号串联的 rc 语义不受影响（纯反馈面、无提前中断的凭据）。
+    #[test]
+    fn pipefail_reports_true_pipeline_failure() {
+        let run = |script: &str| {
+            let out = Command::new("bash")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("启动 bash");
+            out.status.code().expect("bash 进程应有退出码")
+        };
+        // 修正后的桥接形态：真实失败（首段 exit 3）透传（bash -c 的退出码=末命令
+        // 即该管道，与桥接 `__AF_RC=$?` 取内层 bash -lc 退出码同构）。
+        assert_eq!(run("set -o pipefail; cd /tmp && sh -c 'exit 3' | cat"), 3);
+        // 旧行为对照：无 pipefail 时末端 cat 的 0 掩蔽失败（修正前 exit=0 谎报的根源）。
+        assert_eq!(run("cd /tmp && sh -c 'exit 3' | cat"), 0);
+        // 非管道命令 rc 不变。
+        assert_eq!(run("set -o pipefail; cd /tmp && sh -c 'exit 5'"), 5);
+        // 分号串联仍取末段 rc（无提前中断）。
+        assert_eq!(run("set -o pipefail; false; true"), 0);
+        assert_eq!(run("set -o pipefail; true; false"), 1);
     }
 }

@@ -341,7 +341,11 @@ struct Profile {
 
 fn profile(name: &str) -> Result<Profile, String> {
     match name {
-        "mavis-m31f" => Ok(Profile {
+        // "mavis-m31f-p01"：v6-p01 探针基建别名——端点/模型/key/提示词与 mavis-m31f
+        // 完全一致，仅借 --profile 名改容器名后缀（afbench-swev-<task>-<profile>），
+        // 避免与 sample-agg 舰队（同名任务同 profile 时 docker rm -f 互撞）冲突。
+        // 探针基建，非测量语义变更：结果行 profile 字段如实记 mavis-m31f-p01。
+        "mavis-m31f" | "mavis-m31f-p01" => Ok(Profile {
             endpoint: EndpointSpec {
                 protocol: Protocol::AnthropicMessages,
                 base_url: "https://agent.minimaxi.com/mavis/api/v1/llm".into(),
@@ -1032,8 +1036,9 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         "status": "run_failed",
                         // fix4-align2（合流 bump）：scaffold v6 = v4 ∪ v5 机制并集
                         // （墙钟 1800s + 指纹刹车 + bash is_error 负反馈 + 离线三通道
-                        // + 空响应护栏），机制清单见下方结果行注释。
-                        "scaffold": "v6",
+                        // + 空响应护栏）；v6-p01 追加候选③（exec 桥接 pipefail），
+                        // 机制清单见下方结果行注释。
+                        "scaffold": "v6-p01",
                         // D-20 项 1：run_failed 行也记实际目录（trail 留在现场供复核）。
                         "run_dir": attempt_dir.display().to_string(),
                         "eval_sha256": Value::Null,
@@ -1089,10 +1094,15 @@ fn run_swev(args: &Args) -> Result<(), String> {
             //   （error_code 带命令指纹，规则①只对逐字重复失败连击收束）+
             //   离线环境 system/工具描述/instance 三通道声明 + 空响应网络探测护栏
             //   + 规则③累计错误阈值抬至 1000（bash 常态失败不升级）。
+            // · 来自 v6-p01（本分支 fix4-align2-p01，对齐组候选③收窄版）：exec 桥接
+            //   内层 `set -o pipefail`（tb.rs bridge_inner）——管道真实失败不再被末端
+            //   tail/head 的 exit=0 掩蔽，exit=N/is_error 反映真实 rc。纯反馈面、
+            //   零新增刹车：is_error 通道、指纹刹车、止损阈值与判分链全部维持 v6 语义；
+            //   非管道命令 rc 不变、无 errexit 不提前中断。
             // v3 原文：提交式完成协议 + instance 纪律 + 250 步/$3/温度0/top_p1/
             // max_tokens 32000 + 无 gate 重试。reasoning 档位按审计 §6.A.7 显式声明
             // （保持 Off = mini 默认不发 thinking）。
-            "scaffold": "v6",
+            "scaffold": "v6-p01",
             "reasoning_tier": "off",
             // D-20 项 1：实际 run 目录（重跑按序号递增，不再同名覆写）。
             "run_dir": run_dir.display().to_string(),
