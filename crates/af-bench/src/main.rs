@@ -347,7 +347,28 @@ fn profile(name: &str) -> Result<Profile, String> {
                 base_url: "https://agent.minimaxi.com/mavis/api/v1/llm".into(),
                 model: "MiniMax-M3.1-Flash-Preview".into(),
                 key_ref: "mcode-oauth".into(),
-                reasoning_tier: ReasoningTier::Off,
+                // sprint-g2②：Off→High（军令状「thinking high」，M1B 确证杠杆；
+                // endpoint.rs:296-297 组装 body["thinking"]={enabled,4096}，:385 叠进
+                // max_tokens。属请求层参数（军令状②允许），判分链零触碰。）
+                reasoning_tier: ReasoningTier::High,
+                stream: false,
+                auth: Some(AuthStyle::Bearer),
+                max_tokens: None,
+                temperature_milli: None,
+                top_p_milli: None,
+            },
+            key_cmd: "ssh anolis 'python3 ~/.local/bin/mcode-token.py get'",
+        }),
+        // sprint-g2：p01 同型别名——端点与 mavis-m31f 全同（含 thinking High），
+        // 仅独立档案名：容器名 afbench-{task}-{profile}（tb.rs:148）与结果行
+        // profile 字段自带 -g2 后缀，与他线在飞舰队天然隔离（纪律⑤）。
+        "mavis-m31f-g2" => Ok(Profile {
+            endpoint: EndpointSpec {
+                protocol: Protocol::AnthropicMessages,
+                base_url: "https://agent.minimaxi.com/mavis/api/v1/llm".into(),
+                model: "MiniMax-M3.1-Flash-Preview".into(),
+                key_ref: "mcode-oauth".into(),
+                reasoning_tier: ReasoningTier::High,
                 stream: false,
                 auth: Some(AuthStyle::Bearer),
                 max_tokens: None,
@@ -362,7 +383,8 @@ fn profile(name: &str) -> Result<Profile, String> {
                 base_url: "https://agent.minimaxi.com/mavis/api/v1/llm".into(),
                 model: "MiniMax-M3".into(),
                 key_ref: "mcode-oauth".into(),
-                reasoning_tier: ReasoningTier::Off,
+                // sprint-g2②：同 m31f，Off→High。
+                reasoning_tier: ReasoningTier::High,
                 stream: false,
                 auth: Some(AuthStyle::Bearer),
                 max_tokens: None,
@@ -715,13 +737,23 @@ fn bench_order(run_id: &str) -> Result<WorkOrder, String> {
     Ok(order)
 }
 
-/// fix2（结果代号 bump：提示与完成协议均为测量语义变更）。
-/// system 只留一行角色（mini-swe-agent 实证一行 system 足以拿 74%+，字数不是变量，
-/// 纪律随任务重申才是）；全部纪律/工作流/提交协议放 instance 模板随每题重发——
-/// 一次性 system 在长对话里抗遗忘差，是 S0 D2（越权改测试）/D6（交付物缺失）的直接机制。
-/// fix4-align-r2：system 补离线声明（GLM 机制：环境约束零声明是网络空转的一半成因；
-/// system 每轮随请求重发，与 instance 模板/工具描述三通道冗余）。
-const SWEV_SYSTEM_PROMPT: &str = "You are an autonomous software engineer that fixes issues in a real repository by issuing bash commands inside a Linux container. The repository checkout is at /testbed. The container has no usable internet access: network commands fail or return empty responses, so never attempt or retry downloads.";
+/// sprint-g2（激进移植，运营者军令状 2026-10-23 11:1x「mcode 人格提示词全抄」）：
+/// SWEV_SYSTEM_PROMPT 整体替换为 mcode coding 人格系统提示移植版——人格句/收尾
+/// 自包含/纠错风格三条按 计划/研究组/B2提示风格-移交对齐组.md §二 原文逐字移植
+/// （anolis session 2026/10/21/20-43-00-962 coding 臂 systemPrompt 亲读复核，
+/// 含移交件省略号处全句与「Do not end with only a status update…」句）。
+/// 已知偏离（如实登记，按「全抄」军令保留原文）：①af 无 `# Environment` 段，
+/// 人格句 "from Environment" 为悬空引用（B2移交件 §三 R-A）；②「preamble 折叠/
+/// 收尾自包含」的机制前提在 af 不存在（B2移交件 R-C）——本臂按激进移植纲要不求
+/// 单点归因，效应由 sprint 批跑判分。旧一行角色句的运行事实由其余通道承载：
+/// 离线声明=bash 工具描述（tb.rs:461）+ instance 协议 Hard boundaries；
+/// /testbed=instance 协议；角色/工作流=instance 协议 How to work。
+/// instance 协议（SWEV_INSTANCE_PROTOCOL）与题面零改动（军令状①「实例协议消息不动题面」）。
+const SWEV_SYSTEM_PROMPT: &str = r#"You run inside MiniMax Code, a workspace developed by MiniMax. You help users with software engineering tasks.
+Your public-facing identity is MiniMax Code, abbreviated MCode. When asked what to call you, use MCode. For model questions, use the current model name from Environment.
+- Correct yourself when an error changes the user's decision or the work's outcome. Be brief and continue; don't over-apologize or ruminate.
+Preamble messages may be collapsed after the final response is shown. Keep them to brief progress updates; anything the user needs must also appear in the final response.
+The final response must always be fully self-contained: users should never need to read earlier updates, since those updates may be collapsed after the final response is shown. Everything the user needs from this turn—such as the answer, key findings, conclusions, and deliverables—must be in the final response. Include any relevant images, videos, files, or links when they are part of the result. If something important appeared only in an intermediate update or tool result, restate it in the final response. Lead with the outcome. Do not end with only a status update or a promise of future work."#;
 
 /// fix2 instance 模板：随任务 user 消息每题重发。来源：mini-swe-agent instance_template
 /// （工作流四步 + 提交三步 + 边界）+ mcode Core Judgment 两句（不悄悄扩缩任务/歧义先做
@@ -1048,9 +1080,11 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         "trial": args.trial,
                         "reward": Value::Null,
                         "status": "run_failed",
-                        // fix4-align2-tier0：scaffold v8 = v7 − S002/S118 观测折叠
+                        // sprint-g2：scaffold v8-g2 = v8 + p01 型 pipefail 桥接（tb.rs
+                        // bridge_inner）；提示/thinking 变体标记同见本行 reasoning_tier
+                        // 与 harness_commit 双锚定。v8 = v7 − S002/S118 观测折叠
                         // （回归回退，见下方结果行注释）；v7 = v6 + S083 外置。
-                        "scaffold": "v8",
+                        "scaffold": "v8-g2",
                         // S151 溯源：run_failed 行同样锚定产出提交。
                         "harness_commit": harness_commit(),
                         // D-20 项 1：run_failed 行也记实际目录（trail 留在现场供复核）。
@@ -1120,11 +1154,18 @@ fn run_swev(args: &Args) -> Result<(), String> {
             //   + 规则③累计错误阈值抬至 1000（bash 常态失败不升级）。
             // v3 原文：提交式完成协议 + instance 纪律 + 250 步/$3/温度0/top_p1/
             // max_tokens 32000 + 无 gate 重试。reasoning 档位按审计 §6.A.7 显式声明
-            // （保持 Off = mini 默认不发 thinking）。
-            "scaffold": "v8",
+            // （v8 及以前保持 Off = mini 默认不发 thinking；sprint-g2② 起
+            // mavis-m31f/-m3/-g2 改 High，见 profile() 内注释与 reasoning_tier 字段）。
+            // sprint-g2：scaffold v8-g2 = v8 + p01 型 pipefail 桥接（tb.rs:bridge_inner，
+            // 摘 fix4-align2-p01@588382d 同型）+ SWEV_SYSTEM_PROMPT 换 mcode coding
+            // 人格移植版 + mavis-m31f/-m3 reasoning_tier Off→High（请求层参数）。
+            // 250 轮上限 v3 起即 250（main.rs max_turns），本臂无改动。
+            "scaffold": "v8-g2",
             // S151 溯源：本结果行产自哪个 harness 提交（与 scaffold 双锚定）。
             "harness_commit": harness_commit(),
-            "reasoning_tier": "off",
+            // sprint-g2②：改按档案实际档位序列化（ReasoningTier 为 snake_case
+            // Serialize 枚举，spec.rs:26-34）——mavis-m31f/-m3/-g2 现为 "high"。
+            "reasoning_tier": endpoint.reasoning_tier,
             // D-20 项 1：实际 run 目录（重跑按序号递增，不再同名覆写）。
             "run_dir": run_dir.display().to_string(),
             // D-20 项 2：eval.log sha256（判分时计算，判分复核可逐字节对账）。
