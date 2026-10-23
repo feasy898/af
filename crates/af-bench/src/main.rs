@@ -341,13 +341,19 @@ struct Profile {
 
 fn profile(name: &str) -> Result<Profile, String> {
     match name {
-        "mavis-m31f" => Ok(Profile {
+        // "mavis-m31f-g3"：v8-g3 冲刺基建别名（移植 588382d 的 -p01 同型）——端点/模型/
+        // key/提示词与 mavis-m31f 完全一致，仅借 --profile 名改容器名后缀
+        // （afbench-swev-<task>-<profile>），避免与并行变体舰队（同名任务同 profile 时
+        // docker rm -f 互撞）冲突。探针基建，非测量语义变更：结果行 profile 字段如实记。
+        // 本变体携 thinking high（reasoning_tier=High，M1B 杠杆向 af 的迁移——
+        // mavis 网关 Anthropic 协议请求体 thinking.enabled budget=4096）。
+        "mavis-m31f" | "mavis-m31f-g3" => Ok(Profile {
             endpoint: EndpointSpec {
                 protocol: Protocol::AnthropicMessages,
                 base_url: "https://agent.minimaxi.com/mavis/api/v1/llm".into(),
                 model: "MiniMax-M3.1-Flash-Preview".into(),
                 key_ref: "mcode-oauth".into(),
-                reasoning_tier: ReasoningTier::Off,
+                reasoning_tier: ReasoningTier::High,
                 stream: false,
                 auth: Some(AuthStyle::Bearer),
                 max_tokens: None,
@@ -356,13 +362,14 @@ fn profile(name: &str) -> Result<Profile, String> {
             },
             key_cmd: "ssh anolis 'python3 ~/.local/bin/mcode-token.py get'",
         }),
-        "mavis-m3" => Ok(Profile {
+        // "mavis-m3-g3"：同上别名机制，m3 通道回退 lane 用（同 lane 不混 profile）。
+        "mavis-m3" | "mavis-m3-g3" => Ok(Profile {
             endpoint: EndpointSpec {
                 protocol: Protocol::AnthropicMessages,
                 base_url: "https://agent.minimaxi.com/mavis/api/v1/llm".into(),
                 model: "MiniMax-M3".into(),
                 key_ref: "mcode-oauth".into(),
-                reasoning_tier: ReasoningTier::Off,
+                reasoning_tier: ReasoningTier::High,
                 stream: false,
                 auth: Some(AuthStyle::Bearer),
                 max_tokens: None,
@@ -1050,7 +1057,8 @@ fn run_swev(args: &Args) -> Result<(), String> {
                         "status": "run_failed",
                         // fix4-align2-tier0：scaffold v8 = v7 − S002/S118 观测折叠
                         // （回归回退，见下方结果行注释）；v7 = v6 + S083 外置。
-                        "scaffold": "v8",
+                        // v8-g3 = v8 + pipefail（588382d 同型移植）+ thinking high。
+                        "scaffold": "v8-g3",
                         // S151 溯源：run_failed 行同样锚定产出提交。
                         "harness_commit": harness_commit(),
                         // D-20 项 1：run_failed 行也记实际目录（trail 留在现场供复核）。
@@ -1121,10 +1129,19 @@ fn run_swev(args: &Args) -> Result<(), String> {
             // v3 原文：提交式完成协议 + instance 纪律 + 250 步/$3/温度0/top_p1/
             // max_tokens 32000 + 无 gate 重试。reasoning 档位按审计 §6.A.7 显式声明
             // （保持 Off = mini 默认不发 thinking）。
-            "scaffold": "v8",
+            // 来自 v8-g3（本分支 fix4-sprint-g3，冲刺 3 组直觉组合）：
+            // · exec 桥接内层 `set -o pipefail`（tb.rs bridge_inner，移植 588382d
+            //   同型）——管道真实失败不再被末端 tail/head 的 exit=0 掩蔽，exit=N/
+            //   is_error 反映真实 rc。纯反馈面、零新增刹车：is_error 通道、指纹
+            //   刹车、止损阈值与判分链全部维持 v8 语义；非管道命令 rc 不变。
+            // · mavis 两通道 reasoning_tier Off→High（M1B 确证杠杆向 af 的迁移，
+            //   mavis 网关 Anthropic 协议 thinking.enabled budget=4096；结果行
+            //   reasoning_tier 字段同步如实记 high）。人格提示词零引入（与 2 组
+            //   构成单因子差）。
+            "scaffold": "v8-g3",
             // S151 溯源：本结果行产自哪个 harness 提交（与 scaffold 双锚定）。
             "harness_commit": harness_commit(),
-            "reasoning_tier": "off",
+            "reasoning_tier": "high",
             // D-20 项 1：实际 run 目录（重跑按序号递增，不再同名覆写）。
             "run_dir": run_dir.display().to_string(),
             // D-20 项 2：eval.log sha256（判分时计算，判分复核可逐字节对账）。
