@@ -139,6 +139,70 @@ mod tests {
         assert_eq!(rc, None);
         assert_eq!(body, "no marker here");
     }
+
+    /// sprint-g2 冒烟合同（构造指纹，走 af-harness stub 的真实 HTTP 装配链）：
+    /// ①system 通道 = mcode coding 人格移植版（三条指纹逐字在 wire 请求体）；
+    /// ②thinking = enabled/4096（High 档），max_tokens = 32000+4096 叠加；
+    /// ③模型与采样参数与 run_swev 同源。af-harness 不持有人格常量，此测试把
+    /// 「SWEV_SYSTEM_PROMPT → TranscriptItem::System → body["system"]」与
+    /// 「reasoning_tier High → body["thinking"]」两条链在 wire 层钉死。
+    #[test]
+    fn sprint_g2_wire_carries_persona_system_and_thinking_high() {
+        use af_harness::stub::{StubResponse, StubServer};
+        let stub = StubServer::spawn().unwrap();
+        let mut endpoint = profile("mavis-m31f-g2").unwrap().endpoint;
+        endpoint.base_url = stub.url();
+        // 与 run_swev 同源的 fix2 采样参数（run_swev 开头三行）。
+        endpoint.temperature_milli = Some(0);
+        endpoint.top_p_milli = Some(1_000);
+        endpoint.max_tokens = Some(32_000);
+        stub.push(StubResponse::json(
+            200,
+            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}"#,
+        ));
+        let transcript = vec![
+            af_harness::TranscriptItem::System {
+                text: SWEV_SYSTEM_PROMPT.into(),
+            },
+            af_harness::TranscriptItem::User {
+                text: "go".into(),
+            },
+        ];
+        let key = af_harness::EndpointKey::new("sk-contract");
+        let message = af_harness::complete_once(
+            &af_harness::UreqClient::new(),
+            &endpoint,
+            &key,
+            &transcript,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(message.text, "ok");
+        let body: Value = serde_json::from_str(&stub.requests()[0].body).unwrap();
+        // 指纹①：人格句/纠错风格/收尾自包含三条逐字（B2移交件 §二 原文锚点）。
+        let sys = body["system"].as_str().unwrap();
+        assert!(
+            sys.starts_with("You run inside MiniMax Code, a workspace developed by MiniMax."),
+            "{sys}"
+        );
+        assert!(sys.contains("Your public-facing identity is MiniMax Code, abbreviated MCode."));
+        assert!(sys.contains(
+            "Correct yourself when an error changes the user's decision or the work's outcome. Be brief and continue; don't over-apologize or ruminate."
+        ));
+        assert!(sys.contains(
+            "The final response must always be fully self-contained: users should never need to read earlier updates, since those updates may be collapsed after the final response is shown."
+        ));
+        assert!(sys.ends_with(
+            "Lead with the outcome. Do not end with only a status update or a promise of future work."
+        ));
+        // 指纹②：thinking enabled/4096 + max_tokens 叠加（endpoint.rs:296-297/:385-386）。
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 4096);
+        assert_eq!(body["max_tokens"], 36096);
+        assert_eq!(body["model"], "MiniMax-M3.1-Flash-Preview");
+        assert_eq!(body["temperature"], 0.0);
+        assert_eq!(body["top_p"], 1.0);
+    }
 }
 
 // ---------- CLI ----------
